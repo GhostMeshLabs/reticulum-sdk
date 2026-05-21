@@ -179,6 +179,8 @@ pub struct Destination<I: HashIdentity, D: Direction, T: Type> {
     pub r#type: PhantomData<T>,
     pub identity: I,
     pub desc: DestinationDesc,
+    accept_link_requests: bool,
+    prove_packets: bool,
 }
 
 impl<I: HashIdentity, D: Direction, T: Type> Destination<I, D, T> {
@@ -233,6 +235,8 @@ impl Destination<PrivateIdentity, Input, Single> {
                 name,
                 address_hash,
             },
+            accept_link_requests: true,
+            prove_packets: false,
         }
     }
 
@@ -311,13 +315,47 @@ impl Destination<PrivateIdentity, Input, Single> {
 
         match packet.header.packet_type {
             PacketType::LinkRequest => {
-                // TODO: check prove strategy
-                return DestinationHandleStatus::LinkProof;
+                if self.accept_link_requests {
+                    return DestinationHandleStatus::LinkProof;
+                }
             }
             _ => {}
         }
 
         DestinationHandleStatus::None
+    }
+
+    pub fn set_accept_link_requests(&mut self, accept_link_requests: bool) {
+        self.accept_link_requests = accept_link_requests;
+    }
+
+    pub fn set_prove_packets(&mut self, prove_packets: bool) {
+        self.prove_packets = prove_packets;
+    }
+
+    pub fn prove_packets(&self) -> bool {
+        self.prove_packets
+    }
+
+    pub fn proof_packet(&self, packet_hash: &Hash) -> Packet {
+        let signature = self.identity.sign(packet_hash.as_slice());
+
+        let mut packet_data = PacketDataBuffer::new();
+        packet_data.safe_write(packet_hash.as_slice());
+        packet_data.safe_write(&signature.to_bytes());
+
+        Packet {
+            header: Header {
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Proof,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: AddressHash::new_from_hash(packet_hash),
+            transport: None,
+            context: PacketContext::None,
+            data: packet_data,
+        }
     }
 
     pub fn sign_key(&self) -> &SigningKey {
@@ -337,6 +375,8 @@ impl Destination<Identity, Output, Single> {
                 name,
                 address_hash,
             },
+            accept_link_requests: false,
+            prove_packets: false,
         }
     }
 }
@@ -353,6 +393,8 @@ impl<D: Direction> Destination<EmptyIdentity, D, Plain> {
                 name,
                 address_hash,
             },
+            accept_link_requests: false,
+            prove_packets: false,
         }
     }
 }
@@ -374,6 +416,7 @@ pub type PlainOutputDestination = Destination<EmptyIdentity, Output, Plain>;
 
 #[cfg(test)]
 mod tests {
+    use ed25519_dalek::{Signature, SIGNATURE_LENGTH};
     use rand_core::OsRng;
 
     use crate::buffer::OutputBuffer;
@@ -462,5 +505,31 @@ mod tests {
             .expect("valid announce packet");
 
         DestinationAnnounce::validate(&announce).expect("valid announce");
+    }
+
+    #[test]
+    fn create_explicit_packet_proof() {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let destination =
+            SingleInputDestination::new(identity, DestinationName::new("rnstransport", "probe"));
+        let packet_hash = Hash::new_from_slice(b"probe packet");
+        let proof = destination.proof_packet(&packet_hash);
+
+        assert_eq!(proof.destination, packet_hash.into());
+        assert_eq!(proof.header.packet_type, crate::packet::PacketType::Proof);
+        assert_eq!(proof.data.len(), crate::hash::HASH_SIZE + SIGNATURE_LENGTH);
+        assert_eq!(
+            &proof.data.as_slice()[..crate::hash::HASH_SIZE],
+            packet_hash.as_slice()
+        );
+
+        let signature = Signature::from_slice(&proof.data.as_slice()[crate::hash::HASH_SIZE..])
+            .expect("valid signature");
+
+        destination
+            .desc
+            .identity
+            .verify(packet_hash.as_slice(), &signature)
+            .expect("signature validates");
     }
 }

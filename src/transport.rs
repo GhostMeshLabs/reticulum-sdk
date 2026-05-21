@@ -8,6 +8,7 @@ use path_requests::PathRequests;
 use path_requests::TagBytes;
 use path_table::PathTable;
 use rand_core::OsRng;
+use reverse_table::ReverseTable;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time;
@@ -54,6 +55,7 @@ mod link_table;
 mod packet_cache;
 mod path_requests;
 mod path_table;
+mod reverse_table;
 
 // TODO: Configure via features
 const PACKET_TRACE: bool = false;
@@ -72,6 +74,7 @@ const INTERVAL_ANNOUNCES_RETRANSMIT: Duration = Duration::from_secs(1);
 const INTERVAL_OLD_ANNOUNCES_RETRANSMIT: Duration = Duration::from_secs(60);
 const INTERVAL_KEEP_PACKET_CACHED: Duration = Duration::from_secs(180);
 const INTERVAL_PACKET_CACHE_CLEANUP: Duration = Duration::from_secs(90);
+const INTERVAL_KEEP_REVERSE_PATH: Duration = Duration::from_secs(8 * 60);
 
 // Other constants
 const KEEP_ALIVE_REQUEST: u8 = 0xFF;
@@ -101,6 +104,10 @@ pub struct TransportConfig {
     /// Resend announces of remote destinations at a slower pace once
     /// the initial round of announces is over.
     announce_forever: bool,
+
+    /// Create a local `rnstransport.probe` destination that returns
+    /// packet proofs for incoming probe packets.
+    respond_to_probes: bool,
 }
 
 #[derive(Clone)]
@@ -117,8 +124,10 @@ struct TransportHandler {
     path_table: PathTable,
     announce_table: AnnounceTable,
     link_table: LinkTable,
+    reverse_table: ReverseTable,
     single_in_destinations: HashMap<AddressHash, Arc<Mutex<SingleInputDestination>>>,
     single_out_destinations: HashMap<AddressHash, Arc<Mutex<SingleOutputDestination>>>,
+    probe_destination: Option<Arc<Mutex<SingleInputDestination>>>,
 
     announce_limits: AnnounceLimits,
 
@@ -158,6 +167,7 @@ impl TransportConfig {
             reroute_eager: false,
             restart_outlinks: false,
             announce_forever: false,
+            respond_to_probes: false,
         }
     }
 
@@ -180,6 +190,10 @@ impl TransportConfig {
     pub fn set_announce_forever(&mut self, announce_forever: bool) {
         self.announce_forever = announce_forever;
     }
+
+    pub fn set_respond_to_probes(&mut self, respond_to_probes: bool) {
+        self.respond_to_probes = respond_to_probes;
+    }
 }
 
 impl Default for TransportConfig {
@@ -192,6 +206,7 @@ impl Default for TransportConfig {
             reroute_eager: false,
             restart_outlinks: false,
             announce_forever: false,
+            respond_to_probes: false,
         }
     }
 }
@@ -218,6 +233,32 @@ impl Transport {
         let path_requests = PathRequests::new(config.name.as_str(), transport_id);
 
         let path_request_dest = create_path_request_destination().desc.address_hash;
+        let probe_destination = if config.respond_to_probes {
+            let mut destination = SingleInputDestination::new(
+                config.identity.clone(),
+                DestinationName::new("rnstransport", "probe"),
+            );
+            destination.set_accept_link_requests(false);
+            destination.set_prove_packets(true);
+            let address_hash = destination.desc.address_hash;
+
+            let destination = Arc::new(Mutex::new(destination));
+            log::info!(
+                "tp({}): enabled probe responder at {}",
+                config.name,
+                address_hash
+            );
+            Some((address_hash, destination))
+        } else {
+            None
+        };
+        let mut single_in_destinations = HashMap::new();
+        let probe_destination = probe_destination.map(|(address_hash, destination)| {
+            single_in_destinations.insert(address_hash, destination);
+            address_hash
+        });
+        let probe_destination = probe_destination
+            .and_then(|address_hash| single_in_destinations.get(&address_hash).cloned());
 
         let cancel = CancellationToken::new();
         let name = config.name.clone();
@@ -228,8 +269,10 @@ impl Transport {
             announce_table: AnnounceTable::new(),
             link_table: LinkTable::new(),
             path_table: PathTable::new(reroute_eager),
-            single_in_destinations: HashMap::new(),
+            reverse_table: ReverseTable::new(),
+            single_in_destinations,
             single_out_destinations: HashMap::new(),
+            probe_destination,
             announce_limits: AnnounceLimits::new(),
             out_links: HashMap::new(),
             in_links: HashMap::new(),
@@ -520,6 +563,10 @@ impl Transport {
         self.handler.lock().await.single_in_destinations.get(address).cloned()
     }
 
+    pub async fn probe_destination(&self) -> Option<Arc<Mutex<SingleInputDestination>>> {
+        self.handler.lock().await.probe_destination.clone()
+    }
+
     pub async fn get_out_destination(&self, address: &AddressHash)
         -> Option<Arc<Mutex<SingleOutputDestination>>>
     {
@@ -641,6 +688,16 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
         })
         .await;
     }
+
+    let maybe_packet = handler.reverse_table.handle_proof(packet);
+
+    if let Some((packet, iface)) = maybe_packet {
+        handler.send(TxMessage {
+            tx_type: TxMessageType::Direct(iface),
+            packet,
+        })
+        .await;
+    }
 }
 
 async fn send_to_next_hop<'a>(
@@ -687,7 +744,11 @@ async fn handle_keepalive_response<'a>(
     false
 }
 
-async fn handle_data<'a>(packet: &Packet, handler: MutexGuard<'a, TransportHandler>) {
+async fn handle_data<'a>(
+    packet: &Packet,
+    iface: AddressHash,
+    mut handler: MutexGuard<'a, TransportHandler>,
+) {
     let mut data_handled = false;
 
     if packet.header.destination_type == DestinationType::Link {
@@ -730,18 +791,49 @@ async fn handle_data<'a>(packet: &Packet, handler: MutexGuard<'a, TransportHandl
     }
 
     if packet.header.destination_type == DestinationType::Single {
-        if let Some(_destination) = handler
+        if let Some(destination) = handler
             .single_in_destinations
             .get(&packet.destination)
             .cloned()
         {
             data_handled = true;
 
-            handler.received_data_tx.send(ReceivedData {
-                destination: packet.destination.clone(),
-                data: packet.data.clone(),
-            }).ok();
+            let proof = {
+                let destination = destination.lock().await;
+                if destination.prove_packets() {
+                    Some(destination.proof_packet(&packet.hash()))
+                } else {
+                    None
+                }
+            };
+
+            handler
+                .received_data_tx
+                .send(ReceivedData {
+                    destination: packet.destination.clone(),
+                    data: packet.data.clone(),
+                })
+                .ok();
+
+            if let Some(proof) = proof {
+                log::trace!(
+                    "tp({}): send packet proof for {}",
+                    handler.config.name,
+                    packet.destination
+                );
+
+                handler
+                    .send(TxMessage {
+                        tx_type: TxMessageType::Direct(iface),
+                        packet: proof,
+                    })
+                    .await;
+            }
         } else {
+            if let Some((next_hop, _)) = handler.path_table.next_hop_full(&packet.destination) {
+                handler.reverse_table.add(packet, iface, next_hop);
+            }
+
             data_handled = send_to_next_hop(packet, &handler, None).await;
         }
     }
@@ -1138,7 +1230,6 @@ fn create_retransmit_packet(packet: &Packet) -> Packet {
     }
 }
 
-
 async fn manage_transport(
     handler: Arc<Mutex<TransportHandler>>,
     rx_receiver: Arc<Mutex<InterfaceRxReceiver>>,
@@ -1221,7 +1312,7 @@ async fn manage_transport(
                                 handler
                             ).await,
                             PacketType::Proof => handle_proof(&packet, handler).await,
-                            PacketType::Data => handle_data(&packet, handler).await,
+                            PacketType::Data => handle_data(&packet, message.address, handler).await,
                         }
                     }
                 };
@@ -1319,6 +1410,7 @@ async fn manage_transport(
                             .release(INTERVAL_KEEP_PACKET_CACHED);
 
                         handler.link_table.remove_stale();
+                        handler.reverse_table.remove_stale(INTERVAL_KEEP_REVERSE_PATH);
                     },
                 }
             }

@@ -1,15 +1,20 @@
 use std::sync::Once;
 use std::time::Duration;
 
+use ed25519_dalek::{Signature, SIGNATURE_LENGTH};
 use rand_core::OsRng;
 use reticulum::{
     destination::DestinationName,
     destination::link::LinkEvent,
+    hash::{AddressHash, HASH_SIZE},
+    identity::Identity,
     identity::PrivateIdentity,
     iface::{tcp_client::TcpClient, tcp_server::TcpServer},
+    packet::{DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType},
     transport::{Transport, TransportConfig},
 };
 use tokio::time;
+use tokio::sync::broadcast;
 
 static INIT: Once = Once::new();
 
@@ -35,6 +40,48 @@ async fn build_transport_full(
 
     if retransmit {
         config.set_retransmit(true);
+    }
+
+    let transport = Transport::new(config);
+
+    transport.iface_manager().lock().await.spawn(
+        TcpServer::new(server_addr, transport.iface_manager()),
+        TcpServer::spawn,
+    );
+
+    for &addr in client_addr {
+        transport
+            .iface_manager()
+            .lock()
+            .await
+            .spawn(TcpClient::new(addr), TcpClient::spawn);
+    }
+
+    log::info!("test: transport {} created", name);
+
+    transport
+}
+
+async fn build_transport_probe(
+    name: &str,
+    server_addr: &str,
+    client_addr: &[&str],
+    broadcast: bool,
+    retransmit: bool,
+    respond_to_probes: bool,
+) -> Transport {
+    let mut config = TransportConfig::new(
+        name,
+        &PrivateIdentity::new_from_rand(OsRng),
+        broadcast
+    );
+
+    if retransmit {
+        config.set_retransmit(true);
+    }
+
+    if respond_to_probes {
+        config.set_respond_to_probes(true);
     }
 
     let transport = Transport::new(config);
@@ -119,7 +166,7 @@ async fn remote_path_request_and_response() {
         "b",
         "127.0.0.1:8282",
         &["127.0.0.1:8281"],
-        true
+        true,
     ).await;
     let mut transport_c = build_transport("c", "127.0.0.1:8283", &["127.0.0.1:8282"]).await;
 
@@ -147,7 +194,7 @@ async fn remote_path_request_and_response() {
     time::pause();
     time::advance(time::Duration::from_secs(3600)).await;
 
-    transport_b.send_announce(&dest_b, None).await; 
+    transport_b.send_announce(&dest_b, None).await;
     transport_a.recv_announces().await;
     transport_a.request_path(&dest_c_hash, None, None).await;
 
@@ -200,6 +247,156 @@ async fn message_proof_over_remote_link() {
         },
         _ = time::sleep(Duration::from_secs(10)) => {
             unreachable!("Timeout. Expected LinkEvent::Proof was not emitted");
+        },
+    }
+}
+
+fn create_probe_packet(destination: AddressHash, payload: &[u8]) -> Packet {
+    let mut data = PacketDataBuffer::new();
+    data.safe_write(payload);
+
+    Packet {
+        header: Header {
+            destination_type: DestinationType::Single,
+            packet_type: PacketType::Data,
+            ..Default::default()
+        },
+        ifac: None,
+        destination,
+        transport: None,
+        context: PacketContext::None,
+        data,
+    }
+}
+
+fn assert_valid_packet_proof(
+    proof_packet: &Packet,
+    expected_hash: &[u8],
+    proving_identity: Identity,
+) {
+    assert_eq!(proof_packet.header.packet_type, PacketType::Proof);
+    assert_eq!(proof_packet.context, PacketContext::None);
+    assert_eq!(proof_packet.data.len(), HASH_SIZE + SIGNATURE_LENGTH);
+    assert_eq!(&proof_packet.data.as_slice()[..HASH_SIZE], expected_hash);
+
+    let signature = Signature::from_slice(&proof_packet.data.as_slice()[HASH_SIZE..]).unwrap();
+    proving_identity.verify(expected_hash, &signature).unwrap();
+}
+
+async fn recv_expected_proof(
+    iface_rx: &mut broadcast::Receiver<reticulum::iface::RxMessage>,
+    expected_destination: AddressHash,
+) -> Packet {
+    loop {
+        match iface_rx.recv().await.unwrap().packet {
+            packet if packet.header.packet_type == PacketType::Proof
+                && packet.destination == expected_destination =>
+            {
+                return packet;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn probe_destination_returns_direct_packet_proof() {
+    setup();
+
+    let transport_a = build_transport("a", "127.0.0.1:8481", &[]).await;
+    let transport_b = build_transport_probe(
+        "b",
+        "127.0.0.1:8482",
+        &["127.0.0.1:8481"],
+        true,
+        false,
+        true,
+    ).await;
+
+    let probe_destination = transport_b.probe_destination().await.unwrap();
+    let probe_destination = probe_destination.lock().await;
+    let probe_hash = probe_destination.desc.address_hash;
+    let probe_identity = probe_destination.desc.identity;
+    drop(probe_destination);
+
+    time::sleep(Duration::from_secs(2)).await;
+
+    let probe = create_probe_packet(probe_hash, b"probe-direct");
+    let expected_hash = probe.hash();
+    let expected_destination = AddressHash::new_from_hash(&expected_hash);
+
+    let mut iface_rx = transport_a.iface_rx();
+    transport_a.send_packet(probe).await;
+
+    tokio::select! {
+        proof_packet = recv_expected_proof(&mut iface_rx, expected_destination) => {
+            assert_eq!(proof_packet.destination, expected_destination);
+            assert_eq!(proof_packet.header.hops, 0);
+            assert_valid_packet_proof(&proof_packet, expected_hash.as_slice(), probe_identity);
+        },
+        _ = time::sleep(Duration::from_secs(10)) => {
+            unreachable!("Timeout. Expected direct probe proof was not received");
+        },
+    }
+}
+
+#[tokio::test]
+async fn probe_destination_returns_multihop_packet_proof() {
+    setup();
+
+    let transport_a = build_transport("a", "127.0.0.1:8581", &[]).await;
+    let _transport_b = build_transport_probe(
+        "b",
+        "127.0.0.1:8582",
+        &["127.0.0.1:8581"],
+        false,
+        true,
+        false,
+    ).await;
+    let transport_c = build_transport_probe(
+        "c",
+        "127.0.0.1:8583",
+        &["127.0.0.1:8582"],
+        false,
+        false,
+        true,
+    ).await;
+
+    let probe_destination = transport_c.probe_destination().await.unwrap();
+    let probe_destination = probe_destination.lock().await;
+    let probe_hash = probe_destination.desc.address_hash;
+    let probe_identity = probe_destination.desc.identity;
+    drop(probe_destination);
+
+    let probe_destination = transport_c.probe_destination().await.unwrap();
+
+    let mut announces_a = transport_a.recv_announces().await;
+
+    time::sleep(Duration::from_secs(2)).await;
+    transport_c.send_announce(&probe_destination, None).await;
+
+    tokio::select! {
+        _ = announces_a.recv() => {},
+        _ = time::sleep(Duration::from_secs(10)) => {
+            unreachable!("Timeout. Expected probe announce was not received");
+        },
+    }
+
+    let probe = create_probe_packet(probe_hash, b"probe-remote");
+    let expected_hash = probe.hash();
+    let expected_destination = AddressHash::new_from_hash(&expected_hash);
+
+    let mut iface_rx = transport_a.iface_rx();
+    transport_a.send_packet(probe).await;
+
+    tokio::select! {
+        proof_packet = recv_expected_proof(&mut iface_rx, expected_destination) => {
+            assert_eq!(proof_packet.destination, expected_destination);
+            assert!(proof_packet.header.hops >= 1);
+            assert_valid_packet_proof(&proof_packet, expected_hash.as_slice(), probe_identity);
+        },
+        _ = time::sleep(Duration::from_secs(10)) => {
+            unreachable!("Timeout. Expected multihop probe proof was not received");
         },
     }
 }

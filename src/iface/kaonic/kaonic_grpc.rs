@@ -2,7 +2,6 @@ pub mod proto {
     tonic::include_proto!("kaonic");
 }
 
-use std::cmp;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,8 +16,8 @@ use tonic::transport::Channel;
 
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::error::RnsError;
-use crate::iface::{Interface, InterfaceContext, RxMessage};
-use crate::packet::{Packet,PACKET_MDU};
+use crate::iface::{Interface, InterfaceContext, RxMessage, DEFAULT_HW_MTU};
+use crate::packet::Packet;
 use crate::serde::Serialize;
 
 use alloc::string::String;
@@ -282,8 +281,7 @@ fn decode_frame_to_buffer<'a>(
 }
 
 impl Interface for KaonicGrpc {
-    fn mtu() -> usize {
-        // XXX: Make dynamic based on iface bitrate
-        cmp::min(2048, PACKET_MDU)
+    fn hw_mtu() -> usize {
+        DEFAULT_HW_MTU
     }
 }

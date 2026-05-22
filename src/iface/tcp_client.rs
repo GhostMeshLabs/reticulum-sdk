@@ -8,8 +8,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::error::RnsError;
-use crate::iface::RxMessage;
-use crate::packet::{Packet,PACKET_MDU};
+use crate::iface::{Interface, InterfaceContext, RxMessage, DEFAULT_HW_MTU};
+use crate::packet::Packet;
 use crate::serde::Serialize;
 
 use tokio::io::AsyncReadExt;
@@ -17,7 +17,6 @@ use tokio::io::AsyncReadExt;
 use alloc::string::String;
 
 use super::hdlc::Hdlc;
-use super::{Interface, InterfaceContext};
 
 // TODO: Configure via features
 const PACKET_TRACE: bool = false;
@@ -248,8 +247,7 @@ impl TcpClient {
 }
 
 impl Interface for TcpClient {
-    fn mtu() -> usize {
-        // XXX: Make dynamic based on iface bitrate
-        cmp::min(2048, PACKET_MDU)
+    fn hw_mtu() -> usize {
+        DEFAULT_HW_MTU
     }
 }

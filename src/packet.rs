@@ -6,9 +6,14 @@ use crate::buffer::StaticBuffer;
 use crate::hash::AddressHash;
 use crate::hash::Hash;
 
-// Maximum possible MTU
-// XXX: This technically should be 524288, but it overflows stuff atm
-pub const PACKET_MDU: usize = 8192usize;
+// Reticulum uses a fixed 500-byte interoperable packet MTU. The Python
+// reference also reserves one byte for the minimum IFAC field size when
+// calculating MDU: MDU = MTU - HEADER_MAXSIZE - IFAC_MIN_SIZE.
+pub const RETICULUM_MTU: usize = 500usize;
+pub const RETICULUM_MAX_HEADER_SIZE: usize = 35usize;
+pub const RETICULUM_MIN_IFAC_SIZE: usize = 1usize;
+pub const PACKET_MDU: usize =
+    RETICULUM_MTU - RETICULUM_MAX_HEADER_SIZE - RETICULUM_MIN_IFAC_SIZE;
 pub const PACKET_IFAC_MAX_LENGTH: usize = 64usize;
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]

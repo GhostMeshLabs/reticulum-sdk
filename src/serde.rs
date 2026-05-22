@@ -106,7 +106,7 @@ mod tests {
         hash::AddressHash,
         packet::{
             DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext, PacketType,
-            PropagationType,
+            PropagationType, PACKET_MDU, RETICULUM_MTU,
         },
     };
 
@@ -174,5 +174,34 @@ mod tests {
         assert_eq!(packet.transport, new_packet.transport);
         assert_eq!(packet.context, new_packet.context);
         assert_eq!(packet.data.as_slice(), new_packet.data.as_slice());
+    }
+
+    #[test]
+    fn serialized_packet_fits_reticulum_mtu() {
+        let mut output_data = [0u8; RETICULUM_MTU];
+        let mut buffer = OutputBuffer::new(&mut output_data);
+
+        let mut packet = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type2,
+                propagation_type: PropagationType::Broadcast,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Data,
+                hops: 0,
+            },
+            ifac: None,
+            destination: AddressHash::new_from_rand(OsRng),
+            transport: Some(AddressHash::new_from_rand(OsRng)),
+            context: PacketContext::None,
+            data: StaticBuffer::new(),
+        };
+
+        packet.data.resize(PACKET_MDU);
+
+        packet.serialize(&mut buffer).expect("serialized packet");
+
+        assert!(buffer.offset() <= RETICULUM_MTU);
+        assert_eq!(buffer.offset(), RETICULUM_MTU - 1);
     }
 }

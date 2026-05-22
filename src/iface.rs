@@ -22,6 +22,13 @@ pub type InterfaceTxReceiver = mpsc::Receiver<TxMessage>;
 pub type InterfaceRxSender = mpsc::Sender<RxMessage>;
 pub type InterfaceRxReceiver = mpsc::Receiver<RxMessage>;
 
+// Python Reticulum keeps hardware/interface MTU distinct from the fixed
+// interoperable Reticulum packet MTU. Fast interfaces can negotiate higher
+// effective transfer sizes later, but the base packet wire format remains 500
+// bytes. These constants model interface capacity rather than packet format.
+pub const DEFAULT_HW_MTU: usize = 2048;
+pub const MAX_AUTOCONFIGURED_HW_MTU: usize = 524_288;
+
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum TxMessageType {
     Broadcast(Option<AddressHash>),
@@ -80,7 +87,7 @@ impl InterfaceChannel {
 }
 
 pub trait Interface {
-    fn mtu() -> usize;
+    fn hw_mtu() -> usize;
 }
 
 struct LocalInterface {

@@ -140,6 +140,36 @@ impl Identity {
     pub fn derive_key<R: CryptoRngCore + Copy>(&self, rng: R, salt: Option<&[u8]>) -> DerivedKey {
         DerivedKey::new_from_ephemeral_key(rng, &self.public_key, salt)
     }
+
+    pub fn encrypt_packet<'a, R: CryptoRngCore + Copy>(
+        &self,
+        rng: R,
+        text: &[u8],
+        salt: Option<&[u8]>,
+        out_buf: &'a mut [u8],
+    ) -> Result<&'a [u8], RnsError> {
+        let ephemeral_key = EphemeralSecret::random_from_rng(rng);
+        let ephemeral_public = PublicKey::from(&ephemeral_key);
+        let ephemeral_public_bytes = ephemeral_public.as_bytes();
+
+        if out_buf.len() <= ephemeral_public_bytes.len() {
+            return Err(RnsError::OutOfMemory);
+        }
+
+        out_buf[..ephemeral_public_bytes.len()].copy_from_slice(ephemeral_public_bytes);
+
+        let derived_key = DerivedKey::new(&ephemeral_key.diffie_hellman(&self.public_key), salt);
+        let token = Fernet::new_from_slices(
+            &derived_key.as_bytes()[..DERIVED_KEY_LENGTH / 2],
+            &derived_key.as_bytes()[DERIVED_KEY_LENGTH / 2..],
+            rng,
+        )
+        .encrypt(PlainText::from(text), &mut out_buf[ephemeral_public_bytes.len()..])?;
+
+        let out_len = ephemeral_public_bytes.len() + token.len();
+
+        Ok(&out_buf[..out_len])
+    }
 }
 
 impl Default for Identity {
@@ -334,6 +364,35 @@ impl PrivateIdentity {
 
     pub fn derive_key(&self, public_key: &PublicKey, salt: Option<&[u8]>) -> DerivedKey {
         DerivedKey::new_from_private_key(&self.private_key, public_key, salt)
+    }
+
+    pub fn decrypt_packet<'a, R: CryptoRngCore + Copy>(
+        &self,
+        rng: R,
+        data: &[u8],
+        salt: Option<&[u8]>,
+        out_buf: &'a mut [u8],
+    ) -> Result<&'a [u8], RnsError> {
+        if data.len() <= PUBLIC_KEY_LENGTH {
+            return Err(RnsError::InvalidArgument);
+        }
+
+        let mut key_data = [0u8; PUBLIC_KEY_LENGTH];
+        key_data.copy_from_slice(&data[..PUBLIC_KEY_LENGTH]);
+        let ephemeral_public = PublicKey::from(key_data);
+
+        let derived_key = self.derive_key(&ephemeral_public, salt);
+        let fernet = Fernet::new_from_slices(
+            &derived_key.as_bytes()[..DERIVED_KEY_LENGTH / 2],
+            &derived_key.as_bytes()[DERIVED_KEY_LENGTH / 2..],
+            rng,
+        );
+
+        let token = Token::from(&data[PUBLIC_KEY_LENGTH..]);
+        let token = fernet.verify(token)?;
+        let plain_text = fernet.decrypt(token, out_buf)?;
+
+        Ok(plain_text.as_slice())
     }
 }
 

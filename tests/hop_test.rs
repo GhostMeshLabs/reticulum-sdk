@@ -4,13 +4,13 @@ use std::time::Duration;
 use ed25519_dalek::{Signature, SIGNATURE_LENGTH};
 use rand_core::OsRng;
 use reticulum::{
-    destination::DestinationName,
+    destination::{DestinationDesc, DestinationName, SingleOutputDestination},
     destination::link::LinkEvent,
     hash::{AddressHash, HASH_SIZE},
     identity::Identity,
     identity::PrivateIdentity,
     iface::{tcp_client::TcpClient, tcp_server::TcpServer},
-    packet::{DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType},
+    packet::{Packet, PacketContext, PacketType},
     transport::{Transport, TransportConfig},
 };
 use tokio::time;
@@ -251,22 +251,10 @@ async fn message_proof_over_remote_link() {
     }
 }
 
-fn create_probe_packet(destination: AddressHash, payload: &[u8]) -> Packet {
-    let mut data = PacketDataBuffer::new();
-    data.safe_write(payload);
-
-    Packet {
-        header: Header {
-            destination_type: DestinationType::Single,
-            packet_type: PacketType::Data,
-            ..Default::default()
-        },
-        ifac: None,
-        destination,
-        transport: None,
-        context: PacketContext::None,
-        data,
-    }
+fn create_probe_packet(destination: DestinationDesc, payload: &[u8]) -> Packet {
+    SingleOutputDestination::new_from_desc(destination)
+        .data_packet(payload)
+        .expect("encrypted probe packet")
 }
 
 fn assert_valid_packet_proof(
@@ -315,13 +303,13 @@ async fn probe_destination_returns_direct_packet_proof() {
 
     let probe_destination = transport_b.probe_destination().await.unwrap();
     let probe_destination = probe_destination.lock().await;
-    let probe_hash = probe_destination.desc.address_hash;
-    let probe_identity = probe_destination.desc.identity;
+    let probe_desc = probe_destination.desc;
+    let probe_identity = probe_desc.identity;
     drop(probe_destination);
 
     time::sleep(Duration::from_secs(2)).await;
 
-    let probe = create_probe_packet(probe_hash, b"probe-direct");
+    let probe = create_probe_packet(probe_desc, b"probe-direct");
     let expected_hash = probe.hash();
     let expected_destination = AddressHash::new_from_hash(&expected_hash);
 
@@ -364,8 +352,8 @@ async fn probe_destination_returns_multihop_packet_proof() {
 
     let probe_destination = transport_c.probe_destination().await.unwrap();
     let probe_destination = probe_destination.lock().await;
-    let probe_hash = probe_destination.desc.address_hash;
-    let probe_identity = probe_destination.desc.identity;
+    let probe_desc = probe_destination.desc;
+    let probe_identity = probe_desc.identity;
     drop(probe_destination);
 
     let probe_destination = transport_c.probe_destination().await.unwrap();
@@ -382,7 +370,7 @@ async fn probe_destination_returns_multihop_packet_proof() {
         },
     }
 
-    let probe = create_probe_packet(probe_hash, b"probe-remote");
+    let probe = create_probe_packet(probe_desc, b"probe-remote");
     let expected_hash = probe.hash();
     let expected_destination = AddressHash::new_from_hash(&expected_hash);
 

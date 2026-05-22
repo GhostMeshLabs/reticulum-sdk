@@ -2,7 +2,7 @@ pub mod link;
 pub mod link_map;
 
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey, SIGNATURE_LENGTH};
-use rand_core::CryptoRngCore;
+use rand_core::{CryptoRngCore, OsRng};
 use x25519_dalek::PublicKey;
 
 use core::{fmt, marker::PhantomData};
@@ -361,6 +361,11 @@ impl Destination<PrivateIdentity, Input, Single> {
     pub fn sign_key(&self) -> &SigningKey {
         self.identity.sign_key()
     }
+
+    pub fn decrypt<'a>(&self, data: &[u8], out_buf: &'a mut [u8]) -> Result<&'a [u8], RnsError> {
+        self.identity
+            .decrypt_packet(OsRng, data, Some(self.identity.as_address_hash_slice()), out_buf)
+    }
 }
 
 impl Destination<Identity, Output, Single> {
@@ -378,6 +383,46 @@ impl Destination<Identity, Output, Single> {
             accept_link_requests: false,
             prove_packets: false,
         }
+    }
+
+    pub fn new_from_desc(desc: DestinationDesc) -> Self {
+        Self {
+            direction: PhantomData,
+            r#type: PhantomData,
+            identity: desc.identity,
+            desc,
+            accept_link_requests: false,
+            prove_packets: false,
+        }
+    }
+
+    pub fn data_packet(&self, data: &[u8]) -> Result<Packet, RnsError> {
+        let mut packet_data = PacketDataBuffer::new();
+
+        let cipher_text_len = {
+            let cipher_text = self.identity.encrypt_packet(
+                OsRng,
+                data,
+                Some(self.identity.as_address_hash_slice()),
+                packet_data.accuire_buf_max(),
+            )?;
+            cipher_text.len()
+        };
+
+        packet_data.resize(cipher_text_len);
+
+        Ok(Packet {
+            header: Header {
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Data,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: self.desc.address_hash,
+            transport: None,
+            context: PacketContext::None,
+            data: packet_data,
+        })
     }
 }
 
@@ -531,5 +576,29 @@ mod tests {
             .identity
             .verify(packet_hash.as_slice(), &signature)
             .expect("signature validates");
+    }
+
+    #[test]
+    fn single_packet_roundtrip() {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let input_destination = SingleInputDestination::new(
+            identity,
+            DestinationName::new("example_utilities", "single.roundtrip"),
+        );
+        let output_destination = super::SingleOutputDestination::new_from_desc(input_destination.desc);
+
+        let payload = b"hello over single destination";
+        let packet = output_destination
+            .data_packet(payload)
+            .expect("encrypted single packet");
+
+        assert_ne!(packet.data.as_slice(), payload);
+
+        let mut plain_text = [0u8; crate::packet::PACKET_MDU];
+        let decrypted = input_destination
+            .decrypt(packet.data.as_slice(), &mut plain_text)
+            .expect("decrypted single packet");
+
+        assert_eq!(decrypted, payload);
     }
 }

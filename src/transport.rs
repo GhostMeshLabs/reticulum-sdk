@@ -865,24 +865,39 @@ async fn handle_data<'a>(
             .get(&packet.destination)
             .cloned()
         {
-            data_handled = true;
-
-            let proof = {
+            let mut plain_data = PacketDataBuffer::new();
+            let mut proof = None;
+            let decrypted_len = {
                 let destination = destination.lock().await;
                 if destination.prove_packets() {
-                    Some(destination.proof_packet(&packet.hash()))
-                } else {
-                    None
+                    proof = Some(destination.proof_packet(&packet.hash()));
+                }
+
+                match destination.decrypt(packet.data.as_slice(), plain_data.accuire_buf_max()) {
+                    Ok(data) => Some(data.len()),
+                    Err(err) => {
+                        log::warn!(
+                            "tp({}): failed to decrypt packet for {}: {err:?}",
+                            handler.config.name,
+                            packet.destination,
+                        );
+                        None
+                    }
                 }
             };
 
-            handler
-                .received_data_tx
-                .send(ReceivedData {
-                    destination: packet.destination.clone(),
-                    data: packet.data.clone(),
-                })
-                .ok();
+            if let Some(decrypted_len) = decrypted_len {
+                data_handled = true;
+                plain_data.resize(decrypted_len);
+
+                handler
+                    .received_data_tx
+                    .send(ReceivedData {
+                        destination: packet.destination.clone(),
+                        data: plain_data,
+                    })
+                    .ok();
+            }
 
             if let Some(proof) = proof {
                 log::trace!(
@@ -1590,6 +1605,7 @@ async fn manage_transport(
 mod tests {
     use super::*;
 
+    use crate::destination::{DestinationName, SingleOutputDestination};
     use crate::packet::HeaderType;
 
     #[tokio::test]
@@ -1632,5 +1648,32 @@ mod tests {
 
         // Packet should have been removed from cache (stale)
         assert!(handler.lock().await.filter_duplicate_packets(&duplicate).await);
+    }
+
+    #[tokio::test]
+    async fn decrypts_single_destination_packets_before_emitting() {
+        let mut transport = Transport::new(Default::default());
+        let destination = transport
+            .add_destination(
+                PrivateIdentity::new_from_rand(OsRng),
+                DestinationName::new("example_utilities", "single.decrypt"),
+            )
+            .await;
+
+        let destination_desc = destination.lock().await.desc;
+        let output_destination = SingleOutputDestination::new_from_desc(destination_desc);
+        let packet = output_destination
+            .data_packet(b"plaintext payload")
+            .expect("encrypted packet");
+
+        let iface = AddressHash::new_from_rand(OsRng);
+        let handler = transport.get_handler();
+        let mut events = transport.received_data_events();
+
+        handle_data(&packet, iface, handler.lock().await).await;
+
+        let received = events.recv().await.expect("received data event");
+        assert_eq!(received.destination, destination_desc.address_hash);
+        assert_eq!(received.data.as_slice(), b"plaintext payload");
     }
 }

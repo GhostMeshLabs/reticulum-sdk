@@ -1,5 +1,6 @@
 use std::cmp;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -20,6 +21,8 @@ use super::{Interface, InterfaceContext};
 
 // TODO: Configure via features
 const PACKET_TRACE: bool = false;
+const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 
 pub struct TcpClient {
     addr: String,
@@ -49,6 +52,7 @@ impl TcpClient {
 
         let (rx_channel, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
+        let mut reconnect_backoff = INITIAL_RECONNECT_BACKOFF;
 
         let mut running = true;
         'outer: loop {
@@ -80,8 +84,14 @@ impl TcpClient {
             };
 
             if let Err(_) = stream {
-                log::info!("tcp_client: couldn't connect to <{}>", addr);
-                let retry_at = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                log::info!(
+                    "tcp_client: couldn't connect to <{}>, retrying in {}s",
+                    addr,
+                    reconnect_backoff.as_secs()
+                );
+                let retry_at = tokio::time::Instant::now() + reconnect_backoff;
+                reconnect_backoff =
+                    cmp::min(reconnect_backoff.saturating_mul(2), MAX_RECONNECT_BACKOFF);
 
                 loop {
                     let mut tx_channel = tx_channel.lock().await;
@@ -104,6 +114,7 @@ impl TcpClient {
             let stop = CancellationToken::new();
 
             let stream = stream.unwrap();
+            reconnect_backoff = INITIAL_RECONNECT_BACKOFF;
             let (read_stream, write_stream) = stream.into_split();
 
             log::info!("tcp_client connected to <{}>", addr);

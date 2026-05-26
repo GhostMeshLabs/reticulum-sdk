@@ -222,6 +222,56 @@ pub enum DestinationHandleStatus {
 }
 
 impl Destination<PrivateIdentity, Input, Single> {
+    fn build_announce_packet_data(
+        &self,
+        rand_hash: &[u8],
+        app_data: Option<&[u8]>,
+    ) -> Result<PacketDataBuffer, RnsError> {
+        let mut packet_data = PacketDataBuffer::new();
+        let pub_key = self.identity.as_identity().public_key_bytes();
+        let verifying_key = self.identity.as_identity().verifying_key_bytes();
+
+        packet_data
+            .chain_safe_write(self.desc.address_hash.as_slice())
+            .chain_safe_write(pub_key)
+            .chain_safe_write(verifying_key)
+            .chain_safe_write(self.desc.name.as_name_hash_slice())
+            .chain_safe_write(rand_hash);
+
+        if let Some(data) = app_data {
+            packet_data.write(data)?;
+        }
+
+        let signature = self.identity.sign(packet_data.as_slice());
+
+        packet_data.reset();
+
+        packet_data
+            .chain_safe_write(pub_key)
+            .chain_safe_write(verifying_key)
+            .chain_safe_write(self.desc.name.as_name_hash_slice())
+            .chain_safe_write(rand_hash)
+            .chain_safe_write(&signature.to_bytes());
+
+        if let Some(data) = app_data {
+            packet_data.write(data)?;
+        }
+
+        Ok(packet_data)
+    }
+
+    fn build_announce_rand_hash<R: CryptoRngCore + Copy>(
+        &self,
+        rng: R,
+        timestamp_secs: u64,
+    ) -> [u8; RAND_HASH_LENGTH] {
+        let rand_hash = Hash::new_from_rand(rng);
+        let timestamp = timestamp_secs.to_be_bytes();
+        let rand_hash = [&rand_hash.as_slice()[..RAND_HASH_LENGTH / 2], &timestamp[3..]].concat();
+
+        rand_hash.try_into().expect("rand hash has fixed length")
+    }
+
     pub fn new(identity: PrivateIdentity, name: DestinationName) -> Self {
         let address_hash = create_address_hash(&identity, &name);
         let pub_identity = identity.as_identity().clone();
@@ -245,40 +295,9 @@ impl Destination<PrivateIdentity, Input, Single> {
         rng: R,
         app_data: Option<&[u8]>,
     ) -> Result<Packet, RnsError> {
-        let mut packet_data = PacketDataBuffer::new();
-
-        let rand_hash = Hash::new_from_rand(rng);
-        let timestamp = (std::time::UNIX_EPOCH.elapsed().unwrap().as_secs() as u64).to_be_bytes();
-        let rand_hash = [&rand_hash.as_slice()[..RAND_HASH_LENGTH / 2], &timestamp[3..]].concat();
-
-        let pub_key = self.identity.as_identity().public_key_bytes();
-        let verifying_key = self.identity.as_identity().verifying_key_bytes();
-
-        packet_data
-            .chain_safe_write(self.desc.address_hash.as_slice())
-            .chain_safe_write(pub_key)
-            .chain_safe_write(verifying_key)
-            .chain_safe_write(self.desc.name.as_name_hash_slice())
-            .chain_safe_write(&rand_hash);
-
-        if let Some(data) = app_data {
-            packet_data.write(data)?;
-        }
-
-        let signature = self.identity.sign(packet_data.as_slice());
-
-        packet_data.reset();
-
-        packet_data
-            .chain_safe_write(pub_key)
-            .chain_safe_write(verifying_key)
-            .chain_safe_write(self.desc.name.as_name_hash_slice())
-            .chain_safe_write(&rand_hash)
-            .chain_safe_write(&signature.to_bytes());
-
-        if let Some(data) = app_data {
-            packet_data.write(data)?;
-        }
+        let timestamp_secs = std::time::UNIX_EPOCH.elapsed().unwrap().as_secs() as u64;
+        let rand_hash = self.build_announce_rand_hash(rng, timestamp_secs);
+        let packet_data = self.build_announce_packet_data(&rand_hash, app_data)?;
 
         Ok(Packet {
             header: Header {
@@ -307,6 +326,34 @@ impl Destination<PrivateIdentity, Input, Single> {
         announce.context = PacketContext::PathResponse;
 
         Ok(announce)
+    }
+
+    #[cfg(test)]
+    fn announce_with_timestamp<R: CryptoRngCore + Copy>(
+        &self,
+        rng: R,
+        timestamp_secs: u64,
+        app_data: Option<&[u8]>,
+    ) -> Result<Packet, RnsError> {
+        let rand_hash = self.build_announce_rand_hash(rng, timestamp_secs);
+        let packet_data = self.build_announce_packet_data(&rand_hash, app_data)?;
+
+        Ok(Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type1,
+                context_flag: ContextFlag::Unset,
+                propagation_type: PropagationType::Broadcast,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Announce,
+                hops: 0,
+            },
+            ifac: None,
+            destination: self.desc.address_hash,
+            transport: None,
+            context: PacketContext::None,
+            data: packet_data,
+        })
     }
 
     pub fn handle_packet(&mut self, packet: &Packet) -> DestinationHandleStatus {
@@ -463,16 +510,61 @@ pub type PlainOutputDestination = Destination<EmptyIdentity, Output, Plain>;
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::{Signature, SIGNATURE_LENGTH};
-    use rand_core::OsRng;
+    use rand_core::{CryptoRng, OsRng, RngCore};
 
     use crate::buffer::OutputBuffer;
     use crate::hash::Hash;
     use crate::identity::PrivateIdentity;
+    use crate::packet::PacketType;
     use crate::serde::Serialize;
 
     use super::DestinationAnnounce;
     use super::DestinationName;
     use super::SingleInputDestination;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[derive(Copy, Clone)]
+    struct FixedRng {
+        bytes: [u8; 32],
+        offset: usize,
+    }
+
+    impl FixedRng {
+        fn new(bytes: [u8; 32]) -> Self {
+            Self { bytes, offset: 0 }
+        }
+    }
+
+    impl RngCore for FixedRng {
+        fn next_u32(&mut self) -> u32 {
+            let mut buf = [0u8; 4];
+            self.fill_bytes(&mut buf);
+            u32::from_le_bytes(buf)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut buf = [0u8; 8];
+            self.fill_bytes(&mut buf);
+            u64::from_le_bytes(buf)
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for byte in dest {
+                *byte = self.bytes[self.offset % self.bytes.len()];
+                self.offset += 1;
+            }
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    impl CryptoRng for FixedRng {}
 
     #[test]
     fn create_announce() {
@@ -485,17 +577,23 @@ mod tests {
             .announce(OsRng, None)
             .expect("valid announce packet");
 
-        println!("Announce packet {}", announce_packet);
+        assert_eq!(announce_packet.header.packet_type, crate::packet::PacketType::Announce);
+        assert_eq!(announce_packet.destination, single_in_destination.desc.address_hash);
+        assert_eq!(announce_packet.context, crate::packet::PacketContext::None);
+        DestinationAnnounce::validate(&announce_packet).expect("announce validates");
     }
 
     #[test]
     fn create_path_request_hash() {
         let name = DestinationName::new("rnstransport", "path.request");
 
-        println!("PathRequest Name Hash {}", name.hash);
-        println!(
-            "PathRequest Destination Hash {}",
-            Hash::new_from_slice(name.as_name_hash_slice())
+        assert_eq!(
+            name.hash.to_string(),
+            "7926bbe7dd7f9aba88b061551600a25d06ef0f7578202730bd2f224200715efe"
+        );
+        assert_eq!(
+            Hash::new_from_slice(name.as_name_hash_slice()).to_string(),
+            "6b9f66014d9853faab220fba47d027615ec53a8b35c2d620d1f4e0da65de3008"
         );
     }
 
@@ -515,26 +613,44 @@ mod tests {
 
         let priv_identity = PrivateIdentity::new(priv_key.into(), sign_priv_key.into());
 
-        println!("identity hash {}", priv_identity.as_identity().address_hash);
-
         let destination = SingleInputDestination::new(
             priv_identity,
             DestinationName::new("example_utilities", "announcesample.fruits"),
         );
 
-        println!("destination name hash {}", destination.desc.name.hash);
-        println!("destination hash {}", destination.desc.address_hash);
+        assert_eq!(
+            destination.desc.address_hash.to_string(),
+            "/2419dca3c93718497b91990373df1503/"
+        );
+        assert_eq!(
+            destination.desc.name.hash.to_string(),
+            "6f233dfd9aa4cbd4a1e26592edf0627d9ad547d147c9f077d9fd1ce838aa46ee"
+        );
 
         let announce = destination
-            .announce(OsRng, None)
+            .announce_with_timestamp(
+                FixedRng::new([
+                    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                    0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+                    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                    0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+                ]),
+                1_717_171_717,
+                None,
+            )
             .expect("valid announce packet");
 
         let mut output_data = [0u8; 4096];
         let mut buffer = OutputBuffer::new(&mut output_data);
 
-        let _ = announce.serialize(&mut buffer).expect("correct data");
+        announce.serialize(&mut buffer).expect("correct data");
 
-        println!("ANNOUNCE {}", buffer);
+        assert_eq!(announce.header.packet_type, PacketType::Announce);
+        assert_eq!(
+            hex(buffer.as_slice()),
+            "01002419dca3c93718497b91990373df150300a8fd56cbca13577c24914cc4c13308b7d7f3e20bd39c55a4e636984655be343884f6da8c37b5f343568b185a20c63b5bf011a3d60ee805bb9e151371ea1d55556f233dfd9aa4cbd4a1e2630dcd2966006659f605cb792cd1f17f3f8d774ae500f75a2030dcf013bd9d66dd474382baaaffab474e4b5d43516aec24691e63d7fa400eb7a2e16baae82fb526d86f9b4538a0733b08"
+        );
+        DestinationAnnounce::validate(&announce).expect("announce validates");
     }
 
     #[test]

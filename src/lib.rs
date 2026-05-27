@@ -149,6 +149,7 @@ pub mod iface;
 pub mod packet;
 pub mod transport;
 pub mod serde;
+#[cfg(test)]
+pub(crate) mod test_vectors;
 
 mod utils;
-

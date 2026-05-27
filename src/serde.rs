@@ -108,74 +108,90 @@ mod tests {
             ContextFlag, DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
             PacketType, PropagationType, PACKET_MDU, RETICULUM_MTU,
         },
+        test_vectors,
     };
 
     use super::Serialize;
 
     #[test]
-    fn serialize_packet() {
+    fn serialize_forwarded_announce_matches_golden_vector() {
+        let announce_bytes = test_vectors::decode_hex(test_vectors::ANNOUNCE_PACKET_HEX);
+        let mut input_buffer = InputBuffer::new(&announce_bytes);
+        let mut packet = Packet::deserialize(&mut input_buffer).expect("deserialized announce");
+
+        packet.header.header_type = HeaderType::Type2;
+        packet.header.propagation_type = PropagationType::Transport;
+        packet.header.hops = 1;
+        packet.transport = Some(AddressHash::new(
+            test_vectors::FIXED_FORWARDED_ANNOUNCE_TRANSPORT_ID,
+        ));
+
         let mut output_data = [0u8; 4096];
+        let mut output_buffer = OutputBuffer::new(&mut output_data);
+        packet.serialize(&mut output_buffer).expect("serialized forwarded announce");
 
-        let mut buffer = OutputBuffer::new(&mut output_data);
-
-        let packet = Packet {
-            header: Header {
-                ifac_flag: IfacFlag::Open,
-                header_type: HeaderType::Type1,
-                context_flag: ContextFlag::Unset,
-                propagation_type: PropagationType::Broadcast,
-                destination_type: DestinationType::Single,
-                packet_type: PacketType::Announce,
-                hops: 0,
-            },
-            ifac: None,
-            destination: AddressHash::new_from_rand(OsRng),
-            transport: None,
-            context: PacketContext::None,
-            data: StaticBuffer::new(),
-        };
-
-        packet.serialize(&mut buffer).expect("serialized packet");
-
-        println!("{}", buffer);
+        let expected = test_vectors::decode_hex(test_vectors::FORWARDED_ANNOUNCE_PACKET_HEX);
+        assert_eq!(output_buffer.as_slice(), expected.as_slice());
     }
 
     #[test]
-    fn deserialize_packet() {
+    fn deserialize_announce_vector() {
+        let packet_bytes = test_vectors::decode_hex(test_vectors::ANNOUNCE_PACKET_HEX);
+        let mut input_buffer = InputBuffer::new(&packet_bytes);
+        let packet = Packet::deserialize(&mut input_buffer).expect("deserialized announce");
+
+        assert_eq!(packet.header.header_type, HeaderType::Type1);
+        assert_eq!(packet.header.propagation_type, PropagationType::Broadcast);
+        assert_eq!(packet.header.destination_type, DestinationType::Single);
+        assert_eq!(packet.header.packet_type, PacketType::Announce);
+        assert_eq!(packet.context, PacketContext::None);
+        assert_eq!(packet.transport, None);
+
         let mut output_data = [0u8; 4096];
+        let mut output_buffer = OutputBuffer::new(&mut output_data);
+        packet.serialize(&mut output_buffer).expect("reserialized announce");
+        assert_eq!(output_buffer.as_slice(), packet_bytes.as_slice());
+    }
 
-        let mut buffer = OutputBuffer::new(&mut output_data);
+    #[test]
+    fn deserialize_path_response_vector() {
+        let packet_bytes = test_vectors::decode_hex(test_vectors::PATH_RESPONSE_PACKET_HEX);
+        let mut input_buffer = InputBuffer::new(&packet_bytes);
+        let packet = Packet::deserialize(&mut input_buffer).expect("deserialized path response");
 
-        let mut packet = Packet {
-            header: Header {
-                ifac_flag: IfacFlag::Open,
-                header_type: HeaderType::Type1,
-                context_flag: ContextFlag::Set,
-                propagation_type: PropagationType::Broadcast,
-                destination_type: DestinationType::Single,
-                packet_type: PacketType::Announce,
-                hops: 0,
-            },
-            ifac: None,
-            destination: AddressHash::new_from_rand(OsRng),
-            transport: None,
-            context: PacketContext::None,
-            data: StaticBuffer::new(),
-        };
+        assert_eq!(packet.header.header_type, HeaderType::Type1);
+        assert_eq!(packet.header.propagation_type, PropagationType::Broadcast);
+        assert_eq!(packet.header.destination_type, DestinationType::Single);
+        assert_eq!(packet.header.packet_type, PacketType::Announce);
+        assert_eq!(packet.context, PacketContext::PathResponse);
+        assert_eq!(packet.transport, None);
 
-        packet.data.safe_write(b"Hello, world!");
+        let mut output_data = [0u8; 4096];
+        let mut output_buffer = OutputBuffer::new(&mut output_data);
+        packet.serialize(&mut output_buffer).expect("reserialized path response");
+        assert_eq!(output_buffer.as_slice(), packet_bytes.as_slice());
+    }
 
-        packet.serialize(&mut buffer).expect("serialized packet");
+    #[test]
+    fn deserialize_lrproof_vector() {
+        let packet_bytes = test_vectors::decode_hex(test_vectors::LRPROOF_PACKET_HEX);
+        let mut input_buffer = InputBuffer::new(&packet_bytes);
+        let packet = Packet::deserialize(&mut input_buffer).expect("deserialized lrproof");
 
-        let mut input_buffer = InputBuffer::new(buffer.as_slice());
+        assert_eq!(packet.header.header_type, HeaderType::Type1);
+        assert_eq!(packet.header.destination_type, DestinationType::Link);
+        assert_eq!(packet.header.packet_type, PacketType::Proof);
+        assert_eq!(packet.context, PacketContext::LinkRequestProof);
+        assert_eq!(
+            packet.destination,
+            AddressHash::new(test_vectors::FIXED_LRPROOF_LINK_ID)
+        );
+        assert_eq!(packet.transport, None);
 
-        let new_packet = Packet::deserialize(&mut input_buffer).expect("deserialized packet");
-
-        assert_eq!(packet.header, new_packet.header);
-        assert_eq!(packet.destination, new_packet.destination);
-        assert_eq!(packet.transport, new_packet.transport);
-        assert_eq!(packet.context, new_packet.context);
-        assert_eq!(packet.data.as_slice(), new_packet.data.as_slice());
+        let mut output_data = [0u8; 4096];
+        let mut output_buffer = OutputBuffer::new(&mut output_data);
+        packet.serialize(&mut output_buffer).expect("reserialized lrproof");
+        assert_eq!(output_buffer.as_slice(), packet_bytes.as_slice());
     }
 
     #[test]

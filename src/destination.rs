@@ -510,61 +510,18 @@ pub type PlainOutputDestination = Destination<EmptyIdentity, Output, Plain>;
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::{Signature, SIGNATURE_LENGTH};
-    use rand_core::{CryptoRng, OsRng, RngCore};
+    use rand_core::OsRng;
 
     use crate::buffer::OutputBuffer;
     use crate::hash::Hash;
     use crate::identity::PrivateIdentity;
-    use crate::packet::PacketType;
+    use crate::packet::{PacketContext, PacketType};
     use crate::serde::Serialize;
+    use crate::test_vectors;
 
     use super::DestinationAnnounce;
     use super::DestinationName;
     use super::SingleInputDestination;
-
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-
-    #[derive(Copy, Clone)]
-    struct FixedRng {
-        bytes: [u8; 32],
-        offset: usize,
-    }
-
-    impl FixedRng {
-        fn new(bytes: [u8; 32]) -> Self {
-            Self { bytes, offset: 0 }
-        }
-    }
-
-    impl RngCore for FixedRng {
-        fn next_u32(&mut self) -> u32 {
-            let mut buf = [0u8; 4];
-            self.fill_bytes(&mut buf);
-            u32::from_le_bytes(buf)
-        }
-
-        fn next_u64(&mut self) -> u64 {
-            let mut buf = [0u8; 8];
-            self.fill_bytes(&mut buf);
-            u64::from_le_bytes(buf)
-        }
-
-        fn fill_bytes(&mut self, dest: &mut [u8]) {
-            for byte in dest {
-                *byte = self.bytes[self.offset % self.bytes.len()];
-                self.offset += 1;
-            }
-        }
-
-        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-            self.fill_bytes(dest);
-            Ok(())
-        }
-    }
-
-    impl CryptoRng for FixedRng {}
 
     #[test]
     fn create_announce() {
@@ -599,19 +556,7 @@ mod tests {
 
     #[test]
     fn compare_announce() {
-        let priv_key: [u8; 32] = [
-            0xf0, 0xec, 0xbb, 0xa4, 0x9e, 0x78, 0x3d, 0xee, 0x14, 0xff, 0xc6, 0xc9, 0xf1, 0xe1,
-            0x25, 0x1e, 0xfa, 0x7d, 0x76, 0x29, 0xe0, 0xfa, 0x32, 0x41, 0x3c, 0x5c, 0x59, 0xec,
-            0x2e, 0x0f, 0x6d, 0x6c,
-        ];
-
-        let sign_priv_key: [u8; 32] = [
-            0xf0, 0xec, 0xbb, 0xa4, 0x9e, 0x78, 0x3d, 0xee, 0x14, 0xff, 0xc6, 0xc9, 0xf1, 0xe1,
-            0x25, 0x1e, 0xfa, 0x7d, 0x76, 0x29, 0xe0, 0xfa, 0x32, 0x41, 0x3c, 0x5c, 0x59, 0xec,
-            0x2e, 0x0f, 0x6d, 0x6c,
-        ];
-
-        let priv_identity = PrivateIdentity::new(priv_key.into(), sign_priv_key.into());
+        let priv_identity = test_vectors::fixed_private_identity();
 
         let destination = SingleInputDestination::new(
             priv_identity,
@@ -629,13 +574,8 @@ mod tests {
 
         let announce = destination
             .announce_with_timestamp(
-                FixedRng::new([
-                    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-                    0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-                    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-                    0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-                ]),
-                1_717_171_717,
+                test_vectors::FixedRng::new(test_vectors::FIXED_ANNOUNCE_RNG_BYTES),
+                test_vectors::FIXED_ANNOUNCE_TIMESTAMP,
                 None,
             )
             .expect("valid announce packet");
@@ -646,11 +586,34 @@ mod tests {
         announce.serialize(&mut buffer).expect("correct data");
 
         assert_eq!(announce.header.packet_type, PacketType::Announce);
-        assert_eq!(
-            hex(buffer.as_slice()),
-            "01002419dca3c93718497b91990373df150300a8fd56cbca13577c24914cc4c13308b7d7f3e20bd39c55a4e636984655be343884f6da8c37b5f343568b185a20c63b5bf011a3d60ee805bb9e151371ea1d55556f233dfd9aa4cbd4a1e2630dcd2966006659f605cb792cd1f17f3f8d774ae500f75a2030dcf013bd9d66dd474382baaaffab474e4b5d43516aec24691e63d7fa400eb7a2e16baae82fb526d86f9b4538a0733b08"
-        );
+        assert_eq!(buffer.as_slice(), test_vectors::decode_hex(test_vectors::ANNOUNCE_PACKET_HEX));
         DestinationAnnounce::validate(&announce).expect("announce validates");
+    }
+
+    #[test]
+    fn compare_path_response() {
+        let priv_identity = test_vectors::fixed_private_identity();
+        let destination = SingleInputDestination::new(
+            priv_identity,
+            DestinationName::new("example_utilities", "announcesample.fruits"),
+        );
+
+        let announce = destination
+            .announce_with_timestamp(
+                test_vectors::FixedRng::new(test_vectors::FIXED_ANNOUNCE_RNG_BYTES),
+                test_vectors::FIXED_ANNOUNCE_TIMESTAMP,
+                None,
+            )
+            .expect("valid announce packet");
+        let mut path_response = announce.clone();
+        path_response.context = PacketContext::PathResponse;
+
+        let mut output_data = [0u8; 4096];
+        let mut buffer = OutputBuffer::new(&mut output_data);
+        path_response.serialize(&mut buffer).expect("correct data");
+
+        assert_eq!(buffer.as_slice(), test_vectors::decode_hex(test_vectors::PATH_RESPONSE_PACKET_HEX));
+        DestinationAnnounce::validate(&path_response).expect("path response validates");
     }
 
     #[test]
@@ -671,9 +634,9 @@ mod tests {
 
     #[test]
     fn create_explicit_packet_proof() {
-        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let identity = test_vectors::fixed_private_identity();
         let destination =
-            SingleInputDestination::new(identity, DestinationName::new("rnstransport", "probe"));
+            SingleInputDestination::new(identity, DestinationName::new("example_utilities", "announcesample.fruits"));
         let packet_hash = Hash::new_from_slice(b"probe packet");
         let proof = destination.proof_packet(&packet_hash);
 
@@ -693,6 +656,11 @@ mod tests {
             .identity
             .verify(packet_hash.as_slice(), &signature)
             .expect("signature validates");
+
+        let mut output_data = [0u8; 4096];
+        let mut buffer = OutputBuffer::new(&mut output_data);
+        proof.serialize(&mut buffer).expect("serialized proof");
+        assert_eq!(buffer.as_slice(), test_vectors::decode_hex(test_vectors::EXPLICIT_PACKET_PROOF_HEX));
     }
 
     #[test]

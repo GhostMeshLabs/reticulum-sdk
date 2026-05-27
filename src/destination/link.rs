@@ -650,20 +650,25 @@ mod tests {
     use rand_core::OsRng;
 
     use crate::destination::{DestinationName, SingleInputDestination};
+    use crate::hash::AddressHash;
     use crate::identity::PrivateIdentity;
     use crate::packet::{DestinationType, PacketContext, PacketType};
+    use crate::serde::Serialize;
+    use crate::test_vectors;
 
     use super::Link;
 
     #[test]
     fn prove_emits_lrproof_with_link_destination_type() {
-        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let identity = PrivateIdentity::new_from_name("link-proof-destination");
         let destination = SingleInputDestination::new(
             identity,
             DestinationName::new("example_utilities", "link.prove"),
         );
         let (event_tx, _) = tokio::sync::broadcast::channel(1);
         let mut link = Link::new(destination.desc, event_tx);
+        link.id = AddressHash::new(test_vectors::FIXED_LRPROOF_LINK_ID);
+        link.priv_identity = PrivateIdentity::new_from_name("link-proof-identity");
 
         let proof = link.prove();
 
@@ -671,5 +676,12 @@ mod tests {
         assert_eq!(proof.header.packet_type, PacketType::Proof);
         assert_eq!(proof.context, PacketContext::LinkRequestProof);
         assert_eq!(proof.destination, link.id);
+        let mut proof_data = [0u8; 4096];
+        let mut proof_buffer = crate::buffer::OutputBuffer::new(&mut proof_data);
+        proof.serialize(&mut proof_buffer).expect("proof");
+        assert_eq!(
+            proof_buffer.as_slice(),
+            test_vectors::decode_hex(test_vectors::LRPROOF_PACKET_HEX).as_slice()
+        );
     }
 }

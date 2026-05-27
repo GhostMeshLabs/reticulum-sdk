@@ -194,28 +194,49 @@ impl PathRequests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_vectors;
 
     #[test]
     fn path_request_roundtrip() {
         let mut testee = PathRequests::new("", None);
 
-        let dest = AddressHash::new_from_rand(OsRng);
+        let dest = AddressHash::new([
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        ]);
+        let tag = b"fixed-tag".to_vec();
 
-        let encoded = testee.generate(&dest, None);
+        let encoded = testee.generate(&dest, Some(tag.clone()));
+        assert_eq!(
+            encoded.data.as_slice(),
+            test_vectors::decode_hex(test_vectors::PATH_REQUEST_NO_TRANSPORT_DATA_HEX).as_slice()
+        );
         let decoded = testee.decode(encoded.data.as_slice()).unwrap();
 
         assert_eq!(decoded.destination, dest);
+        assert_eq!(decoded.requesting_transport, None);
+        assert_eq!(decoded.tag_bytes, tag);
     }
 
     #[test]
     fn path_request_roundtrip_preserves_requesting_transport() {
-        let transport_id = AddressHash::new_from_rand(OsRng);
+        let transport_id = AddressHash::new([
+            0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88,
+            0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00,
+        ]);
         let mut testee = PathRequests::new("", Some(transport_id));
 
-        let dest = AddressHash::new_from_rand(OsRng);
+        let dest = AddressHash::new([
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        ]);
         let tag = b"fixed-tag".to_vec();
 
         let encoded = testee.generate(&dest, Some(tag.clone()));
+        assert_eq!(
+            encoded.data.as_slice(),
+            test_vectors::decode_hex(test_vectors::PATH_REQUEST_WITH_TRANSPORT_DATA_HEX).as_slice()
+        );
         let decoded = testee.decode(encoded.data.as_slice()).unwrap();
 
         assert_eq!(decoded.destination, dest);

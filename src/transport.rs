@@ -978,9 +978,19 @@ dest_type={:?} ctx={:?} packet_hops={} transport={} transport_matches_destinatio
     if let Ok(result) = DestinationAnnounce::validate(packet) {
         let destination = result.0;
         let app_data = result.1;
-        let dest_hash = destination.identity.address_hash;
+        let identity_hash = destination.identity.address_hash;
         let dest_desc = destination.desc;
         let destination = Arc::new(Mutex::new(destination));
+
+        log::trace!(
+            "tp({}): validated announce destination_hash={} identity_hash={} iface={} \
+is_path_response={}",
+            handler.config.name,
+            packet.destination,
+            identity_hash,
+            iface,
+            packet.context == PacketContext::PathResponse,
+        );
 
         if !handler
             .single_out_destinations
@@ -999,7 +1009,7 @@ dest_type={:?} ctx={:?} packet_hops={} transport={} transport_matches_destinatio
 
         handler.announce_table.add(
             packet,
-            dest_hash,
+            identity_hash,
             iface,
         );
 
@@ -1013,7 +1023,7 @@ dest_type={:?} ctx={:?} packet_hops={} transport={} transport_matches_destinatio
         if retransmit {
             let transport_id = handler.config.identity.address_hash().clone();
             if let Some(message) = handler.announce_table.new_packet(
-                &dest_hash,
+                &identity_hash,
                 &transport_id,
             ) {
                 handler.send(message).await;

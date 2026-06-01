@@ -11,11 +11,30 @@ Reticulum operates independently of traditional IP, and can function effectively
 
 ## Implemented protocol features
 
+> Features implemented from the core Reticulum Protocol
+
 * ✅ rnstransport path.request
 * ✅ rnstransport probe (aka respond_to_probes)
 * ✅ rnstransport discovery (aka discoverable)
 * ❌ rnstransport remote.management (aka enable_remote_management)
 * ❌ info blackhole (aka publish_blackhole)
+
+## Implemented interfaces
+
+> Physical communication interfaces implemented
+
+* ✅ TCPServerInterface
+* ✅ TCPClientInterface
+* ✅ UDPInterface
+* ❌ AutoInterface
+* ❌ BackboneInterface
+* ❌ I2PInterface
+* ❌ RNodeMultiInterface
+* ❌ RNodeInterface
+* ❌ SerialInterface
+* ❌ PipeInterface
+* ❌ KISSInterface
+* ❌ AX25KISSInterface
 
 ## Usage
 

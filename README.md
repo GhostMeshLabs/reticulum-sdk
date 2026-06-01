@@ -9,9 +9,13 @@ readily available hardware, allowing for secure communication without relying on
 
 Reticulum operates independently of traditional IP, and can function effectively in low-bandwidth environments.
 
-## Implementations
+## Implemented protocol features
 
-* Used by the [Rust reticulum-router daemon](https://github.com/GhostMeshLabs/reticulum-router)
+* ✅ rnstransport path.request
+* ✅ rnstransport probe (aka respond_to_probes)
+* ✅ rnstransport discovery (aka discoverable)
+* ❌ rnstransport remote.management (aka enable_remote_management)
+* ❌ info blackhole (aka publish_blackhole)
 
 ## Usage
 
@@ -26,6 +30,10 @@ cargo build
 ```
 cargo test
 ```
+
+## Implementations
+
+* Used by the [Rust reticulum-router daemon](https://github.com/GhostMeshLabs/reticulum-router)
 
 ## License
 

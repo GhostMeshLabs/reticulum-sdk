@@ -8,13 +8,16 @@ pub mod udp;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tokio::task;
+use tokio::time::{self, Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::hash::AddressHash;
 use crate::hash::Hash;
-use crate::packet::Packet;
+use crate::hash::ADDRESS_HASH_SIZE;
+use crate::packet::{HeaderType, Packet, PacketType};
 
 pub type InterfaceTxSender = mpsc::Sender<TxMessage>;
 pub type InterfaceTxReceiver = mpsc::Receiver<TxMessage>;
@@ -28,6 +31,8 @@ pub type InterfaceRxReceiver = mpsc::Receiver<RxMessage>;
 // bytes. These constants model interface capacity rather than packet format.
 pub const DEFAULT_HW_MTU: usize = 2048;
 pub const MAX_AUTOCONFIGURED_HW_MTU: usize = 524_288;
+const DEFAULT_ANNOUNCE_CAP: f64 = 0.02;
+const MAX_QUEUED_ANNOUNCES: usize = 16_384;
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum TxMessageType {
@@ -88,12 +93,146 @@ impl InterfaceChannel {
 
 pub trait Interface {
     fn hw_mtu() -> usize;
+
+    fn bitrate(&self) -> Option<f64> {
+        None
+    }
+
+    fn announce_cap(&self) -> f64 {
+        DEFAULT_ANNOUNCE_CAP
+    }
 }
 
 struct LocalInterface {
     address: AddressHash,
     tx_send: InterfaceTxSender,
     stop: CancellationToken,
+    announce_pacer: Option<AnnouncePacer>,
+}
+
+#[derive(Clone)]
+struct AnnouncePacer {
+    bitrate: f64,
+    announce_cap: f64,
+    state: Arc<tokio::sync::Mutex<AnnouncePacerState>>,
+}
+
+struct AnnouncePacerState {
+    announce_allowed_at: Instant,
+    announce_queue: VecDeque<TxMessage>,
+    timer_active: bool,
+}
+
+impl AnnouncePacer {
+    fn new(bitrate: f64, announce_cap: f64) -> Self {
+        Self {
+            bitrate,
+            announce_cap,
+            state: Arc::new(tokio::sync::Mutex::new(AnnouncePacerState {
+                announce_allowed_at: Instant::now(),
+                announce_queue: VecDeque::new(),
+                timer_active: false,
+            })),
+        }
+    }
+
+    fn wait_time(&self, packet: &Packet) -> Option<Duration> {
+        if self.bitrate <= 0.0 || self.announce_cap <= 0.0 {
+            return None;
+        }
+
+        let transport_len = match packet.header.header_type {
+            HeaderType::Type1 => 0,
+            HeaderType::Type2 => {
+                packet.transport.as_ref()?;
+                ADDRESS_HASH_SIZE
+            }
+        };
+        let packet_len = 2 + transport_len + ADDRESS_HASH_SIZE + 1 + packet.data.len();
+        let tx_time = (packet_len as f64 * 8.0) / self.bitrate;
+
+        Some(Duration::from_secs_f64(tx_time / self.announce_cap))
+    }
+
+    fn should_pace(message: &TxMessage) -> bool {
+        message.packet.header.packet_type == PacketType::Announce && message.packet.header.hops > 0
+    }
+
+    async fn send(&self, tx_send: InterfaceTxSender, stop: CancellationToken, message: TxMessage) {
+        let Some(wait_time) = self.wait_time(&message.packet) else {
+            let _ = tx_send.send(message).await;
+            return;
+        };
+
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        if state.announce_queue.is_empty() && now >= state.announce_allowed_at {
+            state.announce_allowed_at = now + wait_time;
+            drop(state);
+
+            let _ = tx_send.send(message).await;
+            return;
+        }
+
+        if let Some(existing) = state
+            .announce_queue
+            .iter_mut()
+            .find(|entry| entry.packet.destination == message.packet.destination)
+        {
+            *existing = message;
+        } else if state.announce_queue.len() < MAX_QUEUED_ANNOUNCES {
+            state.announce_queue.push_back(message);
+        }
+
+        if !state.timer_active {
+            state.timer_active = true;
+            task::spawn(process_announce_queue(self.clone(), tx_send, stop));
+        }
+    }
+}
+
+async fn process_announce_queue(
+    pacer: AnnouncePacer,
+    tx_send: InterfaceTxSender,
+    stop: CancellationToken,
+) {
+    loop {
+        if stop.is_cancelled() {
+            let mut state = pacer.state.lock().await;
+            state.timer_active = false;
+            return;
+        }
+
+        let next_message = {
+            let mut state = pacer.state.lock().await;
+            let now = Instant::now();
+            if now < state.announce_allowed_at {
+                let wait_time = state.announce_allowed_at - now;
+                drop(state);
+                time::sleep(wait_time).await;
+                continue;
+            }
+
+            match state.announce_queue.pop_front() {
+                Some(message) => {
+                    if let Some(wait_time) = pacer.wait_time(&message.packet) {
+                        state.announce_allowed_at = now + wait_time;
+                    }
+                    Some(message)
+                }
+                None => {
+                    state.timer_active = false;
+                    None
+                }
+            }
+        };
+
+        let Some(message) = next_message else {
+            return;
+        };
+
+        let _ = tx_send.send(message).await;
+    }
 }
 
 pub struct InterfaceContext<T: Interface> {
@@ -125,6 +264,14 @@ impl InterfaceManager {
     }
 
     pub fn new_channel(&mut self, tx_cap: usize) -> InterfaceChannel {
+        self.new_channel_with_pacer(tx_cap, None)
+    }
+
+    fn new_channel_with_pacer(
+        &mut self,
+        tx_cap: usize,
+        announce_pacer: Option<AnnouncePacer>,
+    ) -> InterfaceChannel {
         self.counter += 1;
 
         let counter_bytes = self.counter.to_le_bytes();
@@ -140,6 +287,7 @@ impl InterfaceManager {
             address,
             tx_send,
             stop: stop.clone(),
+            announce_pacer,
         });
 
         InterfaceChannel {
@@ -151,7 +299,12 @@ impl InterfaceManager {
     }
 
     pub fn new_context<T: Interface>(&mut self, inner: T) -> InterfaceContext<T> {
-        let channel = self.new_channel(1);
+        let bitrate = inner.bitrate();
+        let announce_cap = inner.announce_cap();
+        let announce_pacer = bitrate
+            .filter(|bitrate| *bitrate > 0.0 && announce_cap > 0.0)
+            .map(|bitrate| AnnouncePacer::new(bitrate, announce_cap));
+        let channel = self.new_channel_with_pacer(1, announce_pacer);
 
         let inner = Arc::new(Mutex::new(inner));
 
@@ -201,7 +354,17 @@ impl InterfaceManager {
             };
 
             if should_send && !iface.stop.is_cancelled() {
-                let _ = iface.tx_send.send(message.clone()).await;
+                if let Some(pacer) = iface
+                    .announce_pacer
+                    .as_ref()
+                    .filter(|_| AnnouncePacer::should_pace(&message))
+                {
+                    pacer
+                        .send(iface.tx_send.clone(), iface.stop.clone(), message.clone())
+                        .await;
+                } else {
+                    let _ = iface.tx_send.send(message.clone()).await;
+                }
             }
         }
     }
@@ -210,5 +373,103 @@ impl InterfaceManager {
 impl Drop for InterfaceManager {
     fn drop(&mut self) {
         self.cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    use super::*;
+    use crate::buffer::StaticBuffer;
+    use crate::packet::{
+        ContextFlag, DestinationType, Header, HeaderType, IfacFlag, PacketContext, PropagationType,
+    };
+
+    fn announce(destination: u8, hops: u8, data: &[u8]) -> TxMessage {
+        TxMessage {
+            tx_type: TxMessageType::Broadcast(None),
+            packet: Packet {
+                header: Header {
+                    ifac_flag: IfacFlag::Open,
+                    header_type: HeaderType::Type1,
+                    context_flag: ContextFlag::Unset,
+                    propagation_type: PropagationType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Announce,
+                    hops,
+                },
+                ifac: None,
+                destination: AddressHash::new([destination; 16]),
+                transport: None,
+                context: PacketContext::None,
+                data: StaticBuffer::new_from_slice(data),
+            },
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_announces_bypass_announce_pacer() {
+        let mut manager = InterfaceManager::new(1);
+        let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer));
+        let mut receiver = channel.tx_channel;
+
+        manager.send(announce(1, 0, &[1])).await;
+        manager.send(announce(2, 0, &[2])).await;
+
+        assert_eq!(
+            receiver.try_recv().unwrap().packet.destination,
+            AddressHash::new([1; 16])
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap().packet.destination,
+            AddressHash::new([2; 16])
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_announces_are_paced_on_bitrate_limited_interfaces() {
+        let mut manager = InterfaceManager::new(1);
+        let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer));
+        let mut receiver = channel.tx_channel;
+
+        manager.send(announce(1, 1, &[1])).await;
+        assert_eq!(
+            receiver.try_recv().unwrap().packet.destination,
+            AddressHash::new([1; 16])
+        );
+
+        manager.send(announce(2, 1, &[2])).await;
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+        time::advance(Duration::from_secs(1)).await;
+        task::yield_now().await;
+
+        assert_eq!(
+            receiver.try_recv().unwrap().packet.destination,
+            AddressHash::new([2; 16])
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_announces_keep_only_latest_packet_for_destination() {
+        let mut manager = InterfaceManager::new(1);
+        let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer));
+        let mut receiver = channel.tx_channel;
+
+        manager.send(announce(1, 1, &[0])).await;
+        assert_eq!(receiver.try_recv().unwrap().packet.data.as_slice(), &[0]);
+
+        manager.send(announce(2, 1, &[1])).await;
+        manager.send(announce(2, 1, &[2])).await;
+
+        time::advance(Duration::from_secs(1)).await;
+        task::yield_now().await;
+
+        assert_eq!(receiver.try_recv().unwrap().packet.data.as_slice(), &[2]);
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
     }
 }

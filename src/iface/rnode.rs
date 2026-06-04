@@ -320,6 +320,18 @@ impl Interface for RNodeInterface {
     fn hw_mtu() -> usize {
         RNODE_HW_MTU
     }
+
+    fn bitrate(&self) -> Option<f64> {
+        let sf = self.config.spreadingfactor as f64;
+        let cr = self.config.codingrate as f64;
+        let bandwidth = self.config.bandwidth as f64;
+
+        if sf <= 0.0 || cr <= 0.0 || bandwidth <= 0.0 {
+            return None;
+        }
+
+        Some(sf * ((4.0 / cr) / (2.0_f64.powf(sf) / (bandwidth / 1000.0))) * 1000.0)
+    }
 }
 
 #[derive(Debug)]

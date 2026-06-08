@@ -364,6 +364,14 @@ impl PrivateIdentity {
         hex_string
     }
 
+    pub fn shared_instance_rpc_key(&self) -> Vec<u8> {
+        Hash::generator()
+            .chain_update(self.private_key.as_bytes())
+            .chain_update(self.sign_key.as_bytes())
+            .finalize()
+            .to_vec()
+    }
+
     pub fn verify(&self, data: &[u8], signature: &Signature) -> Result<(), RnsError> {
         self.identity.verify(data, signature)
     }

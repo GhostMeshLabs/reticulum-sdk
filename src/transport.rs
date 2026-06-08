@@ -5,6 +5,7 @@ use discovery::create_discovery_destination;
 use discovery::is_discovery_destination;
 use discovery::RegisteredDiscoveryInterface;
 use discovery::DISCOVERY_JOB_INTERVAL;
+use hmac::{Hmac, Mac};
 use link_table::LinkTable;
 use packet_cache::PacketCache;
 use path_requests::create_path_request_destination;
@@ -12,10 +13,15 @@ use path_requests::PathRequests;
 use path_requests::TagBytes;
 use path_table::PathTable;
 use rand_core::OsRng;
+use rand_core::RngCore;
 use reverse_table::ReverseTable;
 use rmpv::Value;
+use sha2::Sha256;
 use std::collections::HashMap;
+use std::net::TcpListener as StdTcpListener;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
@@ -41,6 +47,7 @@ use crate::hash::AddressHash;
 use crate::hash::Hash;
 use crate::identity::PrivateIdentity;
 
+use crate::iface::tcp_client::TcpClient;
 use crate::iface::InterfaceManager;
 use crate::iface::InterfaceRxReceiver;
 use crate::iface::RxMessage;
@@ -92,6 +99,17 @@ const INTERVAL_KEEP_REVERSE_PATH: Duration = Duration::from_secs(8 * 60);
 // Other constants
 const KEEP_ALIVE_REQUEST: u8 = 0xFF;
 const KEEP_ALIVE_RESPONSE: u8 = 0xFE;
+pub const DEFAULT_SHARED_INSTANCE_PORT: u16 = 37428;
+pub const DEFAULT_INSTANCE_CONTROL_PORT: u16 = 37429;
+pub const DEFAULT_INSTANCE_NAME: &str = "default";
+const DEFAULT_PER_HOP_TIMEOUT_SECS: u64 = 6;
+const PY_CONN_CHALLENGE: &[u8] = b"#CHALLENGE#";
+const PY_CONN_WELCOME: &[u8] = b"#WELCOME#";
+const PY_CONN_FAILURE: &[u8] = b"#FAILURE#";
+const PY_CONN_AUTH_MAX_FRAME: usize = 256;
+const SHARED_DATA_AUTH_PROBE_TIMEOUT: Duration = Duration::from_millis(150);
+const SHARED_DATA_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+const PY_CONN_MUTUAL_AUTH_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 pub struct ReceivedData {
@@ -121,12 +139,32 @@ pub struct TransportConfig {
     /// Create a local `rnstransport.probe` destination that returns
     /// packet proofs for incoming probe packets.
     respond_to_probes: bool,
+
+    /// Python-compatible shared instance mode. When enabled, this transport
+    /// tries to become the local shared instance and falls back to connecting
+    /// to an existing one.
+    share_instance: bool,
+    require_shared_instance: bool,
+    shared_instance_type: SharedInstanceType,
+    shared_instance_port: u16,
+    instance_control_port: u16,
+    instance_name: String,
+    rpc_key: Option<Vec<u8>>,
+    is_shared_instance: bool,
+    is_connected_to_shared_instance: bool,
+    is_standalone_instance: bool,
 }
 
 #[derive(Clone)]
 pub struct AnnounceEvent {
     pub destination: Arc<Mutex<SingleOutputDestination>>,
     pub app_data: PacketDataBuffer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedInstanceType {
+    Tcp,
+    Unix,
 }
 
 struct TransportHandler {
@@ -185,6 +223,16 @@ impl TransportConfig {
             restart_outlinks: false,
             announce_forever: false,
             respond_to_probes: false,
+            share_instance: false,
+            require_shared_instance: false,
+            shared_instance_type: SharedInstanceType::Tcp,
+            shared_instance_port: DEFAULT_SHARED_INSTANCE_PORT,
+            instance_control_port: DEFAULT_INSTANCE_CONTROL_PORT,
+            instance_name: DEFAULT_INSTANCE_NAME.into(),
+            rpc_key: None,
+            is_shared_instance: false,
+            is_connected_to_shared_instance: false,
+            is_standalone_instance: true,
         }
     }
 
@@ -211,6 +259,95 @@ impl TransportConfig {
     pub fn set_respond_to_probes(&mut self, respond_to_probes: bool) {
         self.respond_to_probes = respond_to_probes;
     }
+
+    pub fn set_share_instance(&mut self, share_instance: bool) {
+        self.share_instance = share_instance;
+    }
+
+    pub fn share_instance(&self) -> bool {
+        self.share_instance
+    }
+
+    pub fn set_require_shared_instance(&mut self, require_shared_instance: bool) {
+        self.require_shared_instance = require_shared_instance;
+    }
+
+    pub fn require_shared_instance(&self) -> bool {
+        self.require_shared_instance
+    }
+
+    pub fn set_shared_instance_type(&mut self, shared_instance_type: SharedInstanceType) {
+        self.shared_instance_type = shared_instance_type;
+    }
+
+    pub fn shared_instance_type(&self) -> SharedInstanceType {
+        self.shared_instance_type
+    }
+
+    pub fn set_shared_instance_port(&mut self, port: u16) {
+        self.shared_instance_port = port;
+    }
+
+    pub fn shared_instance_port(&self) -> u16 {
+        self.shared_instance_port
+    }
+
+    pub fn set_instance_control_port(&mut self, port: u16) {
+        self.instance_control_port = port;
+    }
+
+    pub fn instance_control_port(&self) -> u16 {
+        self.instance_control_port
+    }
+
+    pub fn set_instance_name<T: Into<String>>(&mut self, name: T) {
+        self.instance_name = name.into();
+    }
+
+    pub fn instance_name(&self) -> &str {
+        &self.instance_name
+    }
+
+    pub fn set_rpc_key<T: Into<Vec<u8>>>(&mut self, rpc_key: T) {
+        self.rpc_key = Some(rpc_key.into());
+    }
+
+    pub fn set_rpc_key_hex(&mut self, rpc_key: &str) -> Result<(), RnsError> {
+        self.rpc_key = Some(Self::parse_rpc_key_hex(rpc_key)?);
+        Ok(())
+    }
+
+    pub fn rpc_key(&self) -> Option<&[u8]> {
+        self.rpc_key.as_deref()
+    }
+
+    fn parse_rpc_key_hex(rpc_key: &str) -> Result<Vec<u8>, RnsError> {
+        let hex = rpc_key
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+
+        if hex.len() % 2 != 0 {
+            return Err(RnsError::InvalidArgument);
+        }
+
+        hex.chunks_exact(2)
+            .map(|chunk| {
+                let high = Self::hex_nibble(chunk[0])?;
+                let low = Self::hex_nibble(chunk[1])?;
+                Ok((high << 4) | low)
+            })
+            .collect()
+    }
+
+    fn hex_nibble(byte: u8) -> Result<u8, RnsError> {
+        match byte {
+            b'0'..=b'9' => Ok(byte - b'0'),
+            b'a'..=b'f' => Ok(byte - b'a' + 10),
+            b'A'..=b'F' => Ok(byte - b'A' + 10),
+            _ => Err(RnsError::InvalidArgument),
+        }
+    }
 }
 
 impl Default for TransportConfig {
@@ -224,12 +361,22 @@ impl Default for TransportConfig {
             restart_outlinks: false,
             announce_forever: false,
             respond_to_probes: false,
+            share_instance: false,
+            require_shared_instance: false,
+            shared_instance_type: SharedInstanceType::Tcp,
+            shared_instance_port: DEFAULT_SHARED_INSTANCE_PORT,
+            instance_control_port: DEFAULT_INSTANCE_CONTROL_PORT,
+            instance_name: DEFAULT_INSTANCE_NAME.into(),
+            rpc_key: None,
+            is_shared_instance: false,
+            is_connected_to_shared_instance: false,
+            is_standalone_instance: true,
         }
     }
 }
 
 impl Transport {
-    pub fn new(config: TransportConfig) -> Self {
+    pub fn new(mut config: TransportConfig) -> Self {
         let (announce_tx, _) = tokio::sync::broadcast::channel(16);
         let (discovery_tx, _) = tokio::sync::broadcast::channel(16);
         let (link_in_event_tx, _) = tokio::sync::broadcast::channel(16);
@@ -242,6 +389,8 @@ impl Transport {
         let rx_receiver = iface_manager.receiver();
 
         let iface_manager = Arc::new(Mutex::new(iface_manager));
+        let cancel = CancellationToken::new();
+        start_shared_instance(&mut config, iface_manager.clone(), cancel.clone());
 
         let transport_id = if config.retransmit {
             Some(config.identity.address_hash().clone())
@@ -281,7 +430,6 @@ impl Transport {
         let probe_destination = probe_destination
             .and_then(|address_hash| single_in_destinations.get(&address_hash).cloned());
 
-        let cancel = CancellationToken::new();
         let name = config.name.clone();
         let reroute_eager = config.reroute_eager;
         let handler = Arc::new(Mutex::new(TransportHandler {
@@ -654,6 +802,22 @@ impl Transport {
         self.handler.lock().await.probe_destination.clone()
     }
 
+    pub async fn is_shared_instance(&self) -> bool {
+        self.handler.lock().await.config.is_shared_instance
+    }
+
+    pub async fn is_connected_to_shared_instance(&self) -> bool {
+        self.handler
+            .lock()
+            .await
+            .config
+            .is_connected_to_shared_instance
+    }
+
+    pub async fn is_standalone_instance(&self) -> bool {
+        self.handler.lock().await.config.is_standalone_instance
+    }
+
     pub async fn register_discoverable_interface(
         &self,
         iface: AddressHash,
@@ -704,6 +868,787 @@ impl Transport {
         // direct access to handler for testing purposes
         self.handler.clone()
     }
+}
+
+fn start_shared_instance(
+    config: &mut TransportConfig,
+    iface_manager: Arc<Mutex<InterfaceManager>>,
+    cancel: CancellationToken,
+) {
+    config.is_shared_instance = false;
+    config.is_connected_to_shared_instance = false;
+    config.is_standalone_instance = false;
+
+    if !config.share_instance {
+        config.is_standalone_instance = true;
+        return;
+    }
+
+    if config.rpc_key.is_none() {
+        config.rpc_key = Some(config.identity.shared_instance_rpc_key());
+    }
+
+    match config.shared_instance_type {
+        SharedInstanceType::Tcp => start_tcp_shared_instance(config, iface_manager, cancel),
+        SharedInstanceType::Unix => {
+            log::warn!(
+                "tp({}): shared_instance_type=unix is not implemented; running standalone",
+                config.name
+            );
+            config.is_standalone_instance = true;
+        }
+    }
+}
+
+fn start_tcp_shared_instance(
+    config: &mut TransportConfig,
+    iface_manager: Arc<Mutex<InterfaceManager>>,
+    cancel: CancellationToken,
+) {
+    let addr = format!("127.0.0.1:{}", config.shared_instance_port);
+
+    match StdTcpListener::bind(&addr) {
+        Ok(listener) => {
+            if config.require_shared_instance {
+                panic!("No shared instance available, but application required it");
+            }
+
+            config.is_shared_instance = true;
+            start_tcp_shared_data_listener(
+                config.name.clone(),
+                addr.clone(),
+                listener,
+                iface_manager,
+                cancel.clone(),
+                config.rpc_key.clone(),
+            );
+            start_tcp_shared_rpc(config, cancel);
+            log::debug!("tp({}): started shared instance on {}", config.name, addr);
+        }
+        Err(error) => {
+            log::trace!(
+                "share_instance: tp({}) connecting local client to <{}>",
+                config.name,
+                addr
+            );
+            let iface_manager_for_task = iface_manager.clone();
+            let client = TcpClient::new(addr.clone());
+            tokio::spawn(async move {
+                iface_manager_for_task
+                    .lock()
+                    .await
+                    .spawn(client, TcpClient::spawn);
+            });
+
+            config.is_connected_to_shared_instance = true;
+            config.retransmit = false;
+            config.respond_to_probes = false;
+            log::debug!(
+                "tp({}): connected to shared instance on {} after bind failed: {}",
+                config.name,
+                addr,
+                error
+            );
+        }
+    }
+}
+
+fn start_tcp_shared_data_listener(
+    name: String,
+    addr: String,
+    listener: StdTcpListener,
+    iface_manager: Arc<Mutex<InterfaceManager>>,
+    cancel: CancellationToken,
+    auth_key: Option<Vec<u8>>,
+) {
+    tokio::spawn(async move {
+        let listener = match listener
+            .set_nonblocking(true)
+            .map(|_| listener)
+            .map_err(|error| error.to_string())
+            .and_then(|listener| TcpListener::from_std(listener).map_err(|error| error.to_string()))
+        {
+            Ok(listener) => listener,
+            Err(error) => {
+                log::error!(
+                    "share_instance: tp({}) could not start data listener <{}>: {}",
+                    name,
+                    addr,
+                    error
+                );
+                return;
+            }
+        };
+
+        log::debug!(
+            "share_instance: tp({}) listening for data clients on <{}>",
+            name,
+            addr
+        );
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    break;
+                }
+                client = listener.accept() => {
+                    match client {
+                        Ok((stream, remote)) => {
+                            log::trace!(
+                                "share_instance: client <{}> connected to <{}>",
+                                remote,
+                                addr
+                            );
+                            let iface_manager = iface_manager.clone();
+                            let auth_key = auth_key.clone();
+                            tokio::spawn(async move {
+                                handle_shared_data_client(stream, remote.to_string(), iface_manager, auth_key.as_deref()).await;
+                            });
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "share_instance: error accepting data client on <{}>: {}",
+                                addr,
+                                error
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+async fn handle_shared_data_client(
+    mut stream: TcpStream,
+    remote: String,
+    iface_manager: Arc<Mutex<InterfaceManager>>,
+    auth_key: Option<&[u8]>,
+) {
+    match try_handle_shared_data_rpc(&mut stream, auth_key).await {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            log::warn!(
+                "share_instance: data-port RPC client <{}> failed: {}",
+                remote,
+                error
+            );
+            return;
+        }
+    }
+
+    iface_manager
+        .lock()
+        .await
+        .spawn(TcpClient::new_from_stream(remote, stream), TcpClient::spawn);
+}
+
+async fn try_handle_shared_data_rpc(
+    stream: &mut TcpStream,
+    auth_key: Option<&[u8]>,
+) -> Result<bool, String> {
+    let challenge = shared_rpc_challenge();
+    write_py_connection_frame(stream, &challenge).await?;
+
+    let Some(response) = read_py_connection_frame_if_ready(
+        stream,
+        PY_CONN_AUTH_MAX_FRAME,
+        SHARED_DATA_AUTH_PROBE_TIMEOUT,
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+
+    if !shared_rpc_response_is_authenticated(&challenge, &response, auth_key)? {
+        let _ = write_py_connection_frame(stream, PY_CONN_FAILURE).await;
+        return Err("authentication failed".into());
+    }
+
+    write_py_connection_frame(stream, PY_CONN_WELCOME).await?;
+    shared_rpc_answer_peer_challenge(stream, auth_key).await?;
+
+    let request = time::timeout(
+        SHARED_DATA_RPC_TIMEOUT,
+        read_py_connection_frame(stream, 64 * 1024),
+    )
+    .await
+    .map_err(|_| "timed out waiting for data-port RPC request".to_string())??;
+    let request = read_python_pickle_value(&request)?;
+    let response = handle_shared_rpc_request(&request);
+
+    let encoded = write_python_pickle_value(&response)?;
+    write_py_connection_frame(stream, &encoded).await?;
+    Ok(true)
+}
+
+fn start_tcp_shared_rpc(config: &TransportConfig, cancel: CancellationToken) {
+    let addr = format!("127.0.0.1:{}", config.instance_control_port);
+    let auth_key = config.rpc_key.clone();
+    let name = config.name.clone();
+
+    tokio::spawn(async move {
+        let listener = match TcpListener::bind(&addr).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                log::error!(
+                    "share_instance: tp({}) could not bind RPC control listener <{}>: {}",
+                    name,
+                    addr,
+                    error
+                );
+                return;
+            }
+        };
+
+        log::debug!(
+            "share_instance: tp({}) listening for RPC control clients on <{}>",
+            name,
+            addr
+        );
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    break;
+                }
+                client = listener.accept() => {
+                    match client {
+                        Ok((stream, remote)) => {
+                            log::trace!(
+                                "share_instance: RPC client <{}> connected to <{}>",
+                                remote,
+                                addr
+                            );
+                            let auth_key = auth_key.clone();
+                            tokio::spawn(async move {
+                                if let Err(error) = handle_shared_rpc_client(stream, auth_key.as_deref()).await {
+                                    log::warn!(
+                                        "share_instance: RPC client <{}> failed: {}",
+                                        remote,
+                                        error
+                                    );
+                                }
+                            });
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "share_instance: error accepting RPC control client on <{}>: {}",
+                                addr,
+                                error
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+async fn handle_shared_rpc_client(
+    mut stream: TcpStream,
+    auth_key: Option<&[u8]>,
+) -> Result<(), String> {
+    shared_rpc_authenticate(&mut stream, auth_key).await?;
+
+    let request = read_py_connection_frame(&mut stream, 64 * 1024).await?;
+    let request = read_python_pickle_value(&request)?;
+    let response = handle_shared_rpc_request(&request);
+
+    let encoded = write_python_pickle_value(&response)?;
+    write_py_connection_frame(&mut stream, &encoded).await
+}
+
+async fn shared_rpc_authenticate(
+    stream: &mut TcpStream,
+    auth_key: Option<&[u8]>,
+) -> Result<(), String> {
+    let challenge = shared_rpc_challenge();
+    write_py_connection_frame(stream, &challenge).await?;
+
+    let response = read_py_connection_frame(stream, 256).await?;
+    let authenticated = shared_rpc_response_is_authenticated(&challenge, &response, auth_key)?;
+
+    if authenticated {
+        write_py_connection_frame(stream, PY_CONN_WELCOME).await?;
+        shared_rpc_answer_peer_challenge(stream, auth_key).await
+    } else {
+        let _ = write_py_connection_frame(stream, PY_CONN_FAILURE).await;
+        Err("authentication failed".into())
+    }
+}
+
+fn shared_rpc_challenge() -> Vec<u8> {
+    let mut random = [0u8; 40];
+    OsRng.fill_bytes(&mut random);
+
+    let mut challenge = Vec::with_capacity(PY_CONN_CHALLENGE.len() + 8 + random.len());
+    challenge.extend_from_slice(PY_CONN_CHALLENGE);
+    challenge.extend_from_slice(b"{sha256}");
+    challenge.extend_from_slice(&random);
+    challenge
+}
+
+fn shared_rpc_response_is_authenticated(
+    challenge: &[u8],
+    response: &[u8],
+    auth_key: Option<&[u8]>,
+) -> Result<bool, String> {
+    let message = &challenge[PY_CONN_CHALLENGE.len()..];
+    if let Some(auth_key) = auth_key {
+        let expected = shared_rpc_hmac_response(auth_key, message)?;
+        let expected_raw = &expected[b"{sha256}".len()..];
+        Ok(response == expected.as_slice() || response == expected_raw)
+    } else {
+        Ok(true)
+    }
+}
+
+async fn shared_rpc_answer_peer_challenge(
+    stream: &mut TcpStream,
+    auth_key: Option<&[u8]>,
+) -> Result<(), String> {
+    let Some(peer_challenge) = read_py_connection_frame_if_ready(
+        stream,
+        PY_CONN_AUTH_MAX_FRAME,
+        PY_CONN_MUTUAL_AUTH_TIMEOUT,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    if !peer_challenge.starts_with(PY_CONN_CHALLENGE) {
+        return Err(format!(
+            "expected peer challenge, got {} bytes starting with {:02x}",
+            peer_challenge.len(),
+            peer_challenge.first().copied().unwrap_or_default()
+        ));
+    }
+
+    let auth_key = auth_key.ok_or_else(|| {
+        "peer requested mutual authentication, but no shared_instance rpc_key is configured"
+            .to_string()
+    })?;
+    let response = shared_rpc_hmac_response(auth_key, &peer_challenge[PY_CONN_CHALLENGE.len()..])?;
+    write_py_connection_frame(stream, &response).await?;
+
+    let welcome = read_py_connection_frame(stream, PY_CONN_AUTH_MAX_FRAME).await?;
+    if welcome == PY_CONN_WELCOME {
+        Ok(())
+    } else if welcome == PY_CONN_FAILURE {
+        Err("peer rejected mutual authentication digest".into())
+    } else {
+        Err(format!(
+            "expected mutual authentication welcome, got {} bytes",
+            welcome.len()
+        ))
+    }
+}
+
+fn shared_rpc_hmac_response(auth_key: &[u8], message: &[u8]) -> Result<Vec<u8>, String> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(auth_key).map_err(|error| error.to_string())?;
+    mac.update(message);
+    let digest = mac.finalize().into_bytes();
+
+    let mut response = Vec::with_capacity(b"{sha256}".len() + digest.len());
+    response.extend_from_slice(b"{sha256}");
+    response.extend_from_slice(&digest);
+    Ok(response)
+}
+
+fn handle_shared_rpc_request(request: &Value) -> Value {
+    let Some(map) = request.as_map() else {
+        return Value::Boolean(false);
+    };
+
+    if let Some(operation) = shared_rpc_map_str(map, "get") {
+        return match operation {
+            "path_table" | "interface_stats" | "rate_table" => Value::Array(vec![]),
+            "next_hop_if_name" => Value::from(""),
+            "next_hop" => Value::Boolean(false),
+            "packet_rssi" | "packet_snr" | "packet_q" => Value::Boolean(false),
+            "first_hop_timeout" => Value::from(DEFAULT_PER_HOP_TIMEOUT_SECS),
+            "link_count" => Value::from(0),
+            "blackholed_identities" => Value::Map(vec![]),
+            "is_blackholed" => Value::Boolean(false),
+            _ => {
+                log::warn!(
+                    "share_instance: unsupported RPC get operation <{}>",
+                    operation
+                );
+                Value::Boolean(false)
+            }
+        };
+    }
+
+    if let Some(operation) = shared_rpc_map_str(map, "drop") {
+        return match operation {
+            "path" => Value::Boolean(false),
+            "all_via" | "announce_queues" => Value::from(0),
+            _ => {
+                log::warn!(
+                    "share_instance: unsupported RPC drop operation <{}>",
+                    operation
+                );
+                Value::Boolean(false)
+            }
+        };
+    }
+
+    if shared_rpc_map_value(map, "destination_data").is_some()
+        || shared_rpc_map_value(map, "identity_data").is_some()
+    {
+        return Value::Boolean(false);
+    }
+
+    if shared_rpc_map_value(map, "blackhole_identity").is_some()
+        || shared_rpc_map_value(map, "unblackhole_identity").is_some()
+    {
+        return Value::Boolean(false);
+    }
+
+    log::warn!("share_instance: unsupported RPC request {:?}", request);
+    Value::Boolean(false)
+}
+
+fn shared_rpc_map_str<'a>(map: &'a [(Value, Value)], name: &str) -> Option<&'a str> {
+    shared_rpc_map_value(map, name).and_then(Value::as_str)
+}
+
+fn shared_rpc_map_value<'a>(map: &'a [(Value, Value)], name: &str) -> Option<&'a Value> {
+    map.iter()
+        .find_map(|(key, value)| (key.as_str() == Some(name)).then_some(value))
+}
+
+enum PickleStackItem {
+    Mark,
+    Value(Value),
+}
+
+fn read_python_pickle_value(data: &[u8]) -> Result<Value, String> {
+    let mut index = 0usize;
+    let mut stack = Vec::<PickleStackItem>::new();
+
+    while index < data.len() {
+        let opcode = data[index];
+        index += 1;
+
+        match opcode {
+            0x80 => {
+                index = index
+                    .checked_add(1)
+                    .filter(|index| *index <= data.len())
+                    .ok_or_else(|| "pickle protocol opcode is truncated".to_string())?;
+            }
+            0x95 => {
+                index = index
+                    .checked_add(8)
+                    .filter(|index| *index <= data.len())
+                    .ok_or_else(|| "pickle frame opcode is truncated".to_string())?;
+            }
+            b'}' => stack.push(PickleStackItem::Value(Value::Map(vec![]))),
+            b'(' => stack.push(PickleStackItem::Mark),
+            0x94 => {}
+            0x8c => {
+                let len = read_pickle_u8(data, &mut index)? as usize;
+                let bytes = read_pickle_bytes(data, &mut index, len)?;
+                let value = std::str::from_utf8(bytes)
+                    .map_err(|error| error.to_string())
+                    .map(Value::from)?;
+                stack.push(PickleStackItem::Value(value));
+            }
+            b'X' => {
+                let len = read_pickle_u32_le(data, &mut index)? as usize;
+                let bytes = read_pickle_bytes(data, &mut index, len)?;
+                let value = std::str::from_utf8(bytes)
+                    .map_err(|error| error.to_string())
+                    .map(Value::from)?;
+                stack.push(PickleStackItem::Value(value));
+            }
+            b'C' => {
+                let len = read_pickle_u8(data, &mut index)? as usize;
+                let bytes = read_pickle_bytes(data, &mut index, len)?;
+                stack.push(PickleStackItem::Value(Value::Binary(bytes.to_vec())));
+            }
+            b'B' => {
+                let len = read_pickle_u32_le(data, &mut index)? as usize;
+                let bytes = read_pickle_bytes(data, &mut index, len)?;
+                stack.push(PickleStackItem::Value(Value::Binary(bytes.to_vec())));
+            }
+            b'N' => stack.push(PickleStackItem::Value(Value::Nil)),
+            0x88 => stack.push(PickleStackItem::Value(Value::Boolean(true))),
+            0x89 => stack.push(PickleStackItem::Value(Value::Boolean(false))),
+            b'K' => stack.push(PickleStackItem::Value(Value::from(read_pickle_u8(
+                data, &mut index,
+            )?))),
+            b'M' => stack.push(PickleStackItem::Value(Value::from(read_pickle_u16_le(
+                data, &mut index,
+            )?))),
+            b'J' => stack.push(PickleStackItem::Value(Value::from(read_pickle_i32_le(
+                data, &mut index,
+            )?))),
+            b'u' => pickle_set_items(&mut stack)?,
+            b's' => pickle_set_item(&mut stack)?,
+            b'.' => {
+                let Some(PickleStackItem::Value(value)) = stack.pop() else {
+                    return Err("pickle did not end with a value".into());
+                };
+                return Ok(value);
+            }
+            opcode => {
+                return Err(format!("unsupported pickle opcode 0x{opcode:02x}"));
+            }
+        }
+    }
+
+    Err("pickle ended without STOP opcode".into())
+}
+
+fn write_python_pickle_value(value: &Value) -> Result<Vec<u8>, String> {
+    let mut encoded = vec![0x80, 0x05];
+    write_python_pickle_payload(&mut encoded, value)?;
+    encoded.push(b'.');
+    Ok(encoded)
+}
+
+fn write_python_pickle_payload(encoded: &mut Vec<u8>, value: &Value) -> Result<(), String> {
+    match value {
+        Value::Nil => encoded.push(b'N'),
+        Value::Boolean(false) => encoded.push(0x89),
+        Value::Boolean(true) => encoded.push(0x88),
+        Value::Integer(integer) => {
+            if let Some(value) = integer.as_u64() {
+                if value <= u8::MAX as u64 {
+                    encoded.push(b'K');
+                    encoded.push(value as u8);
+                } else if value <= u16::MAX as u64 {
+                    encoded.push(b'M');
+                    encoded.extend_from_slice(&(value as u16).to_le_bytes());
+                } else if value <= i32::MAX as u64 {
+                    encoded.push(b'J');
+                    encoded.extend_from_slice(&(value as i32).to_le_bytes());
+                } else {
+                    return Err("integer response is too large for pickle encoder".into());
+                }
+            } else if let Some(value) = integer.as_i64() {
+                if (i32::MIN as i64..=i32::MAX as i64).contains(&value) {
+                    encoded.push(b'J');
+                    encoded.extend_from_slice(&(value as i32).to_le_bytes());
+                } else {
+                    return Err("integer response is too large for pickle encoder".into());
+                }
+            }
+        }
+        Value::String(string) => {
+            let Some(string) = string.as_str() else {
+                return Err("invalid string response".into());
+            };
+            let bytes = string.as_bytes();
+            if bytes.len() <= u8::MAX as usize {
+                encoded.push(0x8c);
+                encoded.push(bytes.len() as u8);
+            } else {
+                encoded.push(b'X');
+                encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            }
+            encoded.extend_from_slice(bytes);
+            encoded.push(0x94);
+        }
+        Value::Binary(bytes) => {
+            if bytes.len() <= u8::MAX as usize {
+                encoded.push(b'C');
+                encoded.push(bytes.len() as u8);
+            } else {
+                encoded.push(b'B');
+                encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            }
+            encoded.extend_from_slice(bytes);
+            encoded.push(0x94);
+        }
+        Value::Array(values) => {
+            encoded.push(b']');
+            encoded.push(0x94);
+            if !values.is_empty() {
+                encoded.push(b'(');
+                for value in values {
+                    write_python_pickle_payload(encoded, value)?;
+                }
+                encoded.push(b'e');
+            }
+        }
+        Value::Map(values) => {
+            encoded.push(b'}');
+            encoded.push(0x94);
+            if !values.is_empty() {
+                encoded.push(b'(');
+                for (key, value) in values {
+                    write_python_pickle_payload(encoded, key)?;
+                    write_python_pickle_payload(encoded, value)?;
+                }
+                encoded.push(b'u');
+            }
+        }
+        _ => return Err("unsupported RPC response type".into()),
+    }
+
+    Ok(())
+}
+
+fn pickle_set_items(stack: &mut Vec<PickleStackItem>) -> Result<(), String> {
+    let mark_index = stack
+        .iter()
+        .rposition(|item| matches!(item, PickleStackItem::Mark))
+        .ok_or_else(|| "pickle SETITEMS without MARK".to_string())?;
+    let values = stack.split_off(mark_index + 1);
+    stack.pop();
+
+    let Some(PickleStackItem::Value(Value::Map(map))) = stack.last_mut() else {
+        return Err("pickle SETITEMS target is not a dict".into());
+    };
+    let mut values = values.into_iter();
+    while let Some(key) = values.next() {
+        let Some(value) = values.next() else {
+            return Err("pickle SETITEMS has odd item count".into());
+        };
+        let PickleStackItem::Value(key) = key else {
+            return Err("pickle SETITEMS key is MARK".into());
+        };
+        let PickleStackItem::Value(value) = value else {
+            return Err("pickle SETITEMS value is MARK".into());
+        };
+        map.push((key, value));
+    }
+
+    Ok(())
+}
+
+fn pickle_set_item(stack: &mut Vec<PickleStackItem>) -> Result<(), String> {
+    let Some(PickleStackItem::Value(value)) = stack.pop() else {
+        return Err("pickle SETITEM missing value".into());
+    };
+    let Some(PickleStackItem::Value(key)) = stack.pop() else {
+        return Err("pickle SETITEM missing key".into());
+    };
+    let Some(PickleStackItem::Value(Value::Map(map))) = stack.last_mut() else {
+        return Err("pickle SETITEM target is not a dict".into());
+    };
+    map.push((key, value));
+    Ok(())
+}
+
+fn read_pickle_bytes<'a>(
+    data: &'a [u8],
+    index: &mut usize,
+    len: usize,
+) -> Result<&'a [u8], String> {
+    let end = index
+        .checked_add(len)
+        .filter(|end| *end <= data.len())
+        .ok_or_else(|| "pickle byte payload is truncated".to_string())?;
+    let bytes = &data[*index..end];
+    *index = end;
+    Ok(bytes)
+}
+
+fn read_pickle_u8(data: &[u8], index: &mut usize) -> Result<u8, String> {
+    let bytes = read_pickle_bytes(data, index, 1)?;
+    Ok(bytes[0])
+}
+
+fn read_pickle_u16_le(data: &[u8], index: &mut usize) -> Result<u16, String> {
+    let bytes = read_pickle_bytes(data, index, 2)?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_pickle_u32_le(data: &[u8], index: &mut usize) -> Result<u32, String> {
+    let bytes = read_pickle_bytes(data, index, 4)?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_pickle_i32_le(data: &[u8], index: &mut usize) -> Result<i32, String> {
+    let bytes = read_pickle_bytes(data, index, 4)?;
+    Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+async fn read_py_connection_frame_if_ready(
+    stream: &mut TcpStream,
+    max_size: usize,
+    timeout: Duration,
+) -> Result<Option<Vec<u8>>, String> {
+    match time::timeout(timeout, stream.readable()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(error.to_string()),
+        Err(_) => return Ok(None),
+    }
+
+    let mut header = [0u8; 4];
+    let peeked = stream
+        .peek(&mut header)
+        .await
+        .map_err(|error| error.to_string())?;
+    if peeked < header.len() {
+        return Ok(None);
+    }
+
+    let size = i32::from_be_bytes(header);
+    if !(0..=max_size as i32).contains(&size) {
+        return Ok(None);
+    }
+
+    read_py_connection_frame(stream, max_size).await.map(Some)
+}
+
+async fn read_py_connection_frame(
+    stream: &mut TcpStream,
+    max_size: usize,
+) -> Result<Vec<u8>, String> {
+    let mut header = [0u8; 4];
+    stream
+        .read_exact(&mut header)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let size = i32::from_be_bytes(header);
+    let size = if size == -1 {
+        let mut long_header = [0u8; 8];
+        stream
+            .read_exact(&mut long_header)
+            .await
+            .map_err(|error| error.to_string())?;
+        u64::from_be_bytes(long_header)
+            .try_into()
+            .map_err(|_| "frame is too large".to_string())?
+    } else if size >= 0 {
+        size as usize
+    } else {
+        return Err("invalid frame length".into());
+    };
+
+    if size > max_size {
+        return Err(format!("frame length {size} exceeds maximum {max_size}"));
+    }
+
+    let mut data = vec![0u8; size];
+    stream
+        .read_exact(&mut data)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(data)
+}
+
+async fn write_py_connection_frame(stream: &mut TcpStream, data: &[u8]) -> Result<(), String> {
+    let len = i32::try_from(data.len()).map_err(|_| "frame is too large".to_string())?;
+    stream
+        .write_all(&len.to_be_bytes())
+        .await
+        .map_err(|error| error.to_string())?;
+    stream
+        .write_all(data)
+        .await
+        .map_err(|error| error.to_string())?;
+    stream.flush().await.map_err(|error| error.to_string())
 }
 
 impl Drop for Transport {
@@ -1818,6 +2763,350 @@ mod tests {
 
     use crate::destination::{DestinationName, SingleInputDestination, SingleOutputDestination};
     use crate::packet::{HeaderType, PACKET_MDU};
+    use std::net::TcpListener as StdTcpListener;
+
+    fn free_local_ports(count: usize) -> Option<Vec<u16>> {
+        let listeners = (0..count)
+            .map(|_| StdTcpListener::bind("127.0.0.1:0").ok())
+            .collect::<Option<Vec<_>>>()?;
+
+        listeners
+            .iter()
+            .map(|listener| listener.local_addr().ok().map(|addr| addr.port()))
+            .collect()
+    }
+
+    #[test]
+    fn shared_instance_config_matches_python_names() {
+        let mut config = TransportConfig::default();
+
+        assert!(!config.share_instance());
+        assert_eq!(config.shared_instance_type(), SharedInstanceType::Tcp);
+        assert_eq!(config.shared_instance_port(), DEFAULT_SHARED_INSTANCE_PORT);
+        assert_eq!(
+            config.instance_control_port(),
+            DEFAULT_INSTANCE_CONTROL_PORT
+        );
+        assert_eq!(config.instance_name(), DEFAULT_INSTANCE_NAME);
+        assert!(!config.require_shared_instance());
+        assert!(config.rpc_key().is_none());
+
+        config.set_share_instance(true);
+        config.set_require_shared_instance(true);
+        config.set_shared_instance_type(SharedInstanceType::Unix);
+        config.set_shared_instance_port(40000);
+        config.set_instance_control_port(40001);
+        config.set_instance_name("mesh-a");
+        config.set_rpc_key(vec![0x42; 24]);
+
+        assert!(config.share_instance());
+        assert!(config.require_shared_instance());
+        assert_eq!(config.shared_instance_type(), SharedInstanceType::Unix);
+        assert_eq!(config.shared_instance_port(), 40000);
+        assert_eq!(config.instance_control_port(), 40001);
+        assert_eq!(config.instance_name(), "mesh-a");
+        assert_eq!(config.rpc_key(), Some(vec![0x42; 24].as_slice()));
+    }
+
+    #[test]
+    fn shared_instance_rpc_key_hex_matches_python_config_parsing() {
+        let mut config = TransportConfig::default();
+
+        config
+            .set_rpc_key_hex("e5 c032D3")
+            .expect("valid Python-style hex key");
+
+        assert_eq!(config.rpc_key(), Some([0xe5, 0xc0, 0x32, 0xd3].as_slice()));
+        assert!(config.set_rpc_key_hex("not hex").is_err());
+        assert!(config.set_rpc_key_hex("abc").is_err());
+    }
+
+    #[tokio::test]
+    async fn tcp_share_instance_first_server_second_client() {
+        let Some(ports) = free_local_ports(1) else {
+            eprintln!("skipping local shared instance test; TCP bind unavailable");
+            return;
+        };
+        let port = ports[0];
+
+        let mut first_config = TransportConfig::default();
+        first_config.set_share_instance(true);
+        first_config.set_shared_instance_port(port);
+        let first = Transport::new(first_config);
+
+        assert!(first.is_shared_instance().await);
+        assert!(!first.is_connected_to_shared_instance().await);
+        assert!(!first.is_standalone_instance().await);
+
+        let mut second_config = TransportConfig::default();
+        second_config.set_share_instance(true);
+        second_config.set_shared_instance_port(port);
+        let second = Transport::new(second_config);
+
+        assert!(!second.is_shared_instance().await);
+        assert!(second.is_connected_to_shared_instance().await);
+        assert!(!second.is_standalone_instance().await);
+    }
+
+    #[tokio::test]
+    async fn shared_rpc_returns_first_hop_timeout() {
+        let Some(ports) = free_local_ports(2) else {
+            eprintln!("skipping shared RPC test; TCP bind unavailable");
+            return;
+        };
+
+        let rpc_key = b"test-rpc-key".to_vec();
+        let mut config = TransportConfig::default();
+        config.set_share_instance(true);
+        config.set_shared_instance_port(ports[0]);
+        config.set_instance_control_port(ports[1]);
+        config.set_rpc_key(rpc_key.clone());
+        let _transport = Transport::new(config);
+
+        let addr = format!("127.0.0.1:{}", ports[1]);
+        let mut stream = None;
+        for _ in 0..20 {
+            match TcpStream::connect(&addr).await {
+                Ok(connected) => {
+                    stream = Some(connected);
+                    break;
+                }
+                Err(_) => time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+        let mut stream = stream.expect("RPC listener accepts connection");
+
+        let challenge = read_py_connection_frame(&mut stream, 256)
+            .await
+            .expect("challenge frame");
+        assert!(challenge.starts_with(PY_CONN_CHALLENGE));
+        let response = shared_rpc_hmac_response(&rpc_key, &challenge[PY_CONN_CHALLENGE.len()..])
+            .expect("hmac response");
+        write_py_connection_frame(&mut stream, &response)
+            .await
+            .expect("response frame");
+        let welcome = read_py_connection_frame(&mut stream, 256)
+            .await
+            .expect("welcome frame");
+        assert_eq!(welcome.as_slice(), PY_CONN_WELCOME);
+        complete_client_side_mutual_auth(&mut stream, &rpc_key).await;
+
+        let request = Value::Map(vec![
+            (Value::from("get"), Value::from("first_hop_timeout")),
+            (
+                Value::from("destination_hash"),
+                Value::Binary(vec![0u8; crate::hash::ADDRESS_HASH_SIZE]),
+            ),
+        ]);
+        let encoded = write_python_pickle_value(&request).expect("encoded request");
+        write_py_connection_frame(&mut stream, &encoded)
+            .await
+            .expect("request frame");
+
+        let response = read_py_connection_frame(&mut stream, 256)
+            .await
+            .expect("response frame");
+        let response = read_python_pickle_value(&response).expect("decoded response");
+        assert_eq!(response.as_u64(), Some(DEFAULT_PER_HOP_TIMEOUT_SECS));
+    }
+
+    #[tokio::test]
+    async fn shared_data_port_accepts_python_connection_auth_probe() {
+        let Some(ports) = free_local_ports(2) else {
+            eprintln!("skipping shared data-port auth test; TCP bind unavailable");
+            return;
+        };
+
+        let rpc_key = b"test-rpc-key".to_vec();
+        let mut config = TransportConfig::default();
+        config.set_share_instance(true);
+        config.set_shared_instance_port(ports[0]);
+        config.set_instance_control_port(ports[1]);
+        config.set_rpc_key(rpc_key.clone());
+        let _transport = Transport::new(config);
+
+        let addr = format!("127.0.0.1:{}", ports[0]);
+        let mut stream = None;
+        for _ in 0..20 {
+            match TcpStream::connect(&addr).await {
+                Ok(connected) => {
+                    stream = Some(connected);
+                    break;
+                }
+                Err(_) => time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+        let mut stream = stream.expect("shared data listener accepts connection");
+
+        let challenge = read_py_connection_frame(&mut stream, PY_CONN_AUTH_MAX_FRAME)
+            .await
+            .expect("challenge frame");
+        assert!(challenge.starts_with(PY_CONN_CHALLENGE));
+        let response = shared_rpc_hmac_response(&rpc_key, &challenge[PY_CONN_CHALLENGE.len()..])
+            .expect("hmac response");
+        write_py_connection_frame(&mut stream, &response)
+            .await
+            .expect("response frame");
+
+        let welcome = read_py_connection_frame(&mut stream, PY_CONN_AUTH_MAX_FRAME)
+            .await
+            .expect("welcome frame");
+        assert_eq!(welcome.as_slice(), PY_CONN_WELCOME);
+        complete_client_side_mutual_auth(&mut stream, &rpc_key).await;
+
+        let request = Value::Map(vec![
+            (Value::from("get"), Value::from("first_hop_timeout")),
+            (
+                Value::from("destination_hash"),
+                Value::Binary(vec![0u8; crate::hash::ADDRESS_HASH_SIZE]),
+            ),
+        ]);
+        let encoded = write_python_pickle_value(&request).expect("encoded request");
+        write_py_connection_frame(&mut stream, &encoded)
+            .await
+            .expect("request frame");
+
+        let response = read_py_connection_frame(&mut stream, 256)
+            .await
+            .expect("response frame");
+        let response = read_python_pickle_value(&response).expect("decoded response");
+        assert_eq!(response.as_u64(), Some(DEFAULT_PER_HOP_TIMEOUT_SECS));
+    }
+
+    #[tokio::test]
+    async fn shared_rpc_derives_default_key_from_transport_identity() {
+        let Some(ports) = free_local_ports(2) else {
+            eprintln!("skipping shared RPC auth test; TCP bind unavailable");
+            return;
+        };
+
+        let identity = PrivateIdentity::new_from_name("shared-rpc-default-key-test");
+        let rpc_key = identity.shared_instance_rpc_key();
+        let mut config = TransportConfig::new("shared-rpc-default-key-test", &identity, false);
+        config.set_share_instance(true);
+        config.set_shared_instance_port(ports[0]);
+        config.set_instance_control_port(ports[1]);
+        let _transport = Transport::new(config);
+
+        let addr = format!("127.0.0.1:{}", ports[1]);
+        let mut stream = None;
+        for _ in 0..20 {
+            match TcpStream::connect(&addr).await {
+                Ok(connected) => {
+                    stream = Some(connected);
+                    break;
+                }
+                Err(_) => time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+        let mut stream = stream.expect("RPC listener accepts connection");
+
+        let challenge = read_py_connection_frame(&mut stream, 256)
+            .await
+            .expect("challenge frame");
+        let response = shared_rpc_hmac_response(&rpc_key, &challenge[PY_CONN_CHALLENGE.len()..])
+            .expect("hmac response");
+        write_py_connection_frame(&mut stream, &response)
+            .await
+            .expect("response frame");
+
+        let welcome = read_py_connection_frame(&mut stream, 256)
+            .await
+            .expect("welcome frame");
+        assert_eq!(welcome.as_slice(), PY_CONN_WELCOME);
+        complete_client_side_mutual_auth(&mut stream, &rpc_key).await;
+    }
+
+    async fn complete_client_side_mutual_auth(stream: &mut TcpStream, rpc_key: &[u8]) {
+        let peer_challenge = shared_rpc_challenge();
+        write_py_connection_frame(stream, &peer_challenge)
+            .await
+            .expect("peer challenge frame");
+
+        let response = read_py_connection_frame(stream, PY_CONN_AUTH_MAX_FRAME)
+            .await
+            .expect("peer response frame");
+        assert!(
+            shared_rpc_response_is_authenticated(&peer_challenge, &response, Some(rpc_key))
+                .expect("peer response verification")
+        );
+
+        write_py_connection_frame(stream, PY_CONN_WELCOME)
+            .await
+            .expect("peer welcome frame");
+    }
+
+    #[test]
+    fn shared_rpc_handles_python_client_requests() {
+        let expected = [
+            ("path_table", Value::Array(vec![])),
+            ("interface_stats", Value::Array(vec![])),
+            ("rate_table", Value::Array(vec![])),
+            ("next_hop_if_name", Value::from("")),
+            ("next_hop", Value::Boolean(false)),
+            (
+                "first_hop_timeout",
+                Value::from(DEFAULT_PER_HOP_TIMEOUT_SECS),
+            ),
+            ("link_count", Value::from(0)),
+            ("packet_rssi", Value::Boolean(false)),
+            ("packet_snr", Value::Boolean(false)),
+            ("packet_q", Value::Boolean(false)),
+            ("blackholed_identities", Value::Map(vec![])),
+            ("is_blackholed", Value::Boolean(false)),
+        ];
+
+        for (operation, response) in expected {
+            let request = Value::Map(vec![(Value::from("get"), Value::from(operation))]);
+            let actual = handle_shared_rpc_request(&request);
+            assert_eq!(actual, response);
+
+            let encoded = write_python_pickle_value(&actual).expect("encoded response");
+            assert_eq!(encoded.first(), Some(&0x80));
+            assert_ne!(
+                encoded.first(),
+                Some(&0xc2),
+                "RPC response must not be MessagePack false"
+            );
+        }
+
+        let request = Value::Map(vec![(
+            Value::from("destination_data"),
+            Value::from("retain"),
+        )]);
+        let response = handle_shared_rpc_request(&request);
+        assert_eq!(response, Value::Boolean(false));
+
+        let request = Value::Map(vec![(Value::from("identity_data"), Value::from("retain"))]);
+        let response = handle_shared_rpc_request(&request);
+        assert_eq!(response, Value::Boolean(false));
+
+        let unsupported = Value::Map(vec![(Value::from("get"), Value::from("unsupported"))]);
+        let response = handle_shared_rpc_request(&unsupported);
+        assert_eq!(response, Value::Boolean(false));
+
+        let encoded = write_python_pickle_value(&response).expect("encoded response");
+        assert_eq!(encoded.first(), Some(&0x80));
+    }
+
+    #[test]
+    fn shared_rpc_decodes_python_pickled_request() {
+        let request = read_python_pickle_value(&[
+            0x80, 0x05, 0x95, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7d, 0x94, 0x28,
+            0x8c, 0x03, b'g', b'e', b't', 0x94, 0x8c, 0x11, b'f', b'i', b'r', b's', b't', b'_',
+            b'h', b'o', b'p', b'_', b't', b'i', b'm', b'e', b'o', b'u', b't', 0x94, 0x8c, 0x10,
+            b'd', b'e', b's', b't', b'i', b'n', b'a', b't', b'i', b'o', b'n', b'_', b'h', b'a',
+            b's', b'h', 0x94, b'C', 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x94, b'u', b'.',
+        ])
+        .expect("Python pickle request");
+
+        let response = handle_shared_rpc_request(&request);
+        assert_eq!(response.as_u64(), Some(DEFAULT_PER_HOP_TIMEOUT_SECS));
+
+        let encoded = write_python_pickle_value(&response).expect("pickle response");
+        assert_eq!(encoded, vec![0x80, 0x05, b'K', 0x06, b'.']);
+    }
 
     #[tokio::test]
     async fn drop_duplicates() {
@@ -1994,7 +3283,10 @@ mod tests {
 
         assert_eq!(sent.tx_type, TxMessageType::Direct(iface));
         assert_eq!(sent.packet.header.header_type, HeaderType::Type2);
-        assert_eq!(sent.packet.header.propagation_type, PropagationType::Transport);
+        assert_eq!(
+            sent.packet.header.propagation_type,
+            PropagationType::Transport
+        );
         assert_eq!(sent.packet.destination, destination);
         assert_eq!(sent.packet.transport, Some(next_hop));
     }

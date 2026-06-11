@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use rand_core::OsRng;
 use reticulum_sdk::{
+    destination::DestinationName,
     identity::PrivateIdentity,
     iface::{tcp_client::TcpClient, tcp_server::TcpServer},
     transport::{DiscoveryInterfaceConfig, Transport, TransportConfig},
@@ -154,4 +155,62 @@ async fn shared_instance_client_receives_network_discovery_announces() {
     assert_eq!(discovered.name, "Remote Discovery");
     assert_eq!(discovered.reachable_on.as_deref(), Some("127.0.0.1"));
     assert_eq!(discovered.port, Some(remote_port));
+}
+
+#[tokio::test]
+async fn shared_instance_client_receives_passive_destination_announces() {
+    setup();
+
+    let addrs = free_local_addrs(4);
+    let shared_port = addrs[0].port();
+    let server_addr = addrs[1].to_string();
+    let remote_addr = addrs[2].to_string();
+    let control_port = addrs[3].port();
+
+    let mut server_config = TransportConfig::new(
+        "shared-server-passive",
+        &PrivateIdentity::new_from_rand(OsRng),
+        true,
+    );
+    server_config.set_share_instance(true);
+    server_config.set_shared_instance_port(shared_port);
+    server_config.set_instance_control_port(control_port);
+    let server = Transport::new(server_config);
+    server.iface_manager().lock().await.spawn(
+        TcpServer::new(&server_addr, server.iface_manager()),
+        TcpServer::spawn,
+    );
+
+    let mut client_config = TransportConfig::new(
+        "shared-client-passive",
+        &PrivateIdentity::new_from_rand(OsRng),
+        true,
+    );
+    client_config.set_share_instance(true);
+    client_config.set_shared_instance_port(shared_port);
+    let client = Transport::new(client_config);
+    let mut announce_rx = client.recv_announces().await;
+
+    let (mut remote, _remote_server_iface) =
+        build_transport("remote-passive", &remote_addr, &[server_addr.as_str()]).await;
+    let destination = remote
+        .add_destination(
+            PrivateIdentity::new_from_rand(OsRng),
+            DestinationName::new("test", "passive_announce"),
+        )
+        .await;
+    let destination_hash = destination.lock().await.desc.address_hash;
+
+    time::sleep(Duration::from_secs(2)).await;
+    remote.send_announce(&destination, None).await;
+
+    let announce = time::timeout(Duration::from_secs(10), announce_rx.recv())
+        .await
+        .expect("shared-instance client did not receive passive destination announce")
+        .unwrap();
+
+    assert_eq!(
+        announce.destination.lock().await.desc.address_hash,
+        destination_hash
+    );
 }

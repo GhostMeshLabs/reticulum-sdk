@@ -1881,12 +1881,13 @@ async fn handle_data<'a>(
             let mut proof = None;
             let decrypted_len = {
                 let destination = destination.lock().await;
-                if destination.prove_packets() {
-                    proof = Some(destination.proof_packet(&packet.hash()));
-                }
-
                 match destination.decrypt(packet.data.as_slice(), plain_data.accuire_buf_max()) {
-                    Ok(data) => Some(data.len()),
+                    Ok(data) => {
+                        if destination.prove_packets() {
+                            proof = Some(destination.proof_packet(&packet.hash()));
+                        }
+                        Some(data.len())
+                    }
                     Err(err) => {
                         log::warn!(
                             "tp({}): failed to decrypt packet for {}: {err:?}",
@@ -3221,6 +3222,43 @@ mod tests {
         let received = events.recv().await.expect("received data event");
         assert_eq!(received.destination, destination_desc.address_hash);
         assert_eq!(received.data.as_slice(), b"plaintext payload");
+    }
+
+    #[tokio::test]
+    async fn invalid_single_destination_ciphertext_is_not_proved() {
+        let mut transport = Transport::new(Default::default());
+        let destination = transport
+            .add_destination(
+                PrivateIdentity::new_from_rand(OsRng),
+                DestinationName::new("example_utilities", "single.proof"),
+            )
+            .await;
+        destination.lock().await.set_prove_packets(true);
+
+        let destination_desc = destination.lock().await.desc;
+        let output_destination = SingleOutputDestination::new_from_desc(destination_desc);
+        let mut packet = output_destination
+            .data_packet(b"plaintext payload")
+            .expect("encrypted packet");
+        let last = packet.data.len() - 1;
+        packet.data.as_mut_slice()[last] ^= 0x01;
+
+        let handler = transport.get_handler();
+        let (iface, mut tx) = {
+            let iface_manager = transport.iface_manager();
+            let mut iface_manager = iface_manager.lock().await;
+            let channel = iface_manager.new_channel(4);
+            (*channel.address(), channel.tx_channel)
+        };
+
+        handle_data(&packet, iface, handler.lock().await).await;
+
+        assert!(
+            time::timeout(Duration::from_millis(100), tx.recv())
+                .await
+                .is_err(),
+            "invalid ciphertext must not receive a packet proof"
+        );
     }
 
     #[tokio::test]

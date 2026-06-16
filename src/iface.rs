@@ -36,6 +36,7 @@ const DEFAULT_ANNOUNCE_CAP: f64 = 0.02;
 const DEFAULT_INTERFACE_TX_QUEUE_CAP: usize = 128;
 const MAX_QUEUED_ANNOUNCES: usize = 16_384;
 const INTERFACE_SEND_TIMEOUT: Duration = Duration::from_millis(100);
+const SATURATED_QUEUE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum TxMessageType {
@@ -111,7 +112,60 @@ struct LocalInterface {
     tx_send: InterfaceTxSender,
     stop: CancellationToken,
     announce_pacer: Option<AnnouncePacer>,
+    saturated_queue_logger: SaturatedQueueLogger,
     shared_instance_client: bool,
+}
+
+#[derive(Clone)]
+struct SaturatedQueueLogger {
+    iface: AddressHash,
+    state: Arc<tokio::sync::Mutex<SaturatedQueueLogState>>,
+}
+
+struct SaturatedQueueLogState {
+    next_log_at: Instant,
+    suppressed: usize,
+}
+
+impl SaturatedQueueLogger {
+    fn new(iface: AddressHash) -> Self {
+        Self {
+            iface,
+            state: Arc::new(tokio::sync::Mutex::new(SaturatedQueueLogState {
+                next_log_at: Instant::now(),
+                suppressed: 0,
+            })),
+        }
+    }
+
+    async fn warn_drop(&self, tx_type: TxMessageType) {
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        if now < state.next_log_at {
+            state.suppressed += 1;
+            return;
+        }
+
+        let suppressed = state.suppressed;
+        state.suppressed = 0;
+        state.next_log_at = now + SATURATED_QUEUE_LOG_INTERVAL;
+        drop(state);
+
+        if suppressed > 0 {
+            log::warn!(
+                "iface: dropping outbound packet for saturated interface queue iface={} tx_type={:?} suppressed_drops={}",
+                self.iface,
+                tx_type,
+                suppressed
+            );
+        } else {
+            log::warn!(
+                "iface: dropping outbound packet for saturated interface queue iface={} tx_type={:?}",
+                self.iface,
+                tx_type
+            );
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -162,9 +216,15 @@ impl AnnouncePacer {
         message.packet.header.packet_type == PacketType::Announce && message.packet.header.hops > 0
     }
 
-    async fn send(&self, tx_send: InterfaceTxSender, stop: CancellationToken, message: TxMessage) {
+    async fn send(
+        &self,
+        tx_send: InterfaceTxSender,
+        stop: CancellationToken,
+        saturated_queue_logger: SaturatedQueueLogger,
+        message: TxMessage,
+    ) {
         let Some(wait_time) = self.wait_time(&message.packet) else {
-            send_or_drop(&tx_send, message).await;
+            send_or_drop(&tx_send, message, Some(&saturated_queue_logger)).await;
             return;
         };
 
@@ -174,7 +234,7 @@ impl AnnouncePacer {
             state.announce_allowed_at = now + wait_time;
             drop(state);
 
-            send_or_drop(&tx_send, message).await;
+            send_or_drop(&tx_send, message, Some(&saturated_queue_logger)).await;
             return;
         }
 
@@ -190,7 +250,12 @@ impl AnnouncePacer {
 
         if !state.timer_active {
             state.timer_active = true;
-            task::spawn(process_announce_queue(self.clone(), tx_send, stop));
+            task::spawn(process_announce_queue(
+                self.clone(),
+                tx_send,
+                stop,
+                saturated_queue_logger,
+            ));
         }
     }
 }
@@ -199,6 +264,7 @@ async fn process_announce_queue(
     pacer: AnnouncePacer,
     tx_send: InterfaceTxSender,
     stop: CancellationToken,
+    saturated_queue_logger: SaturatedQueueLogger,
 ) {
     loop {
         if stop.is_cancelled() {
@@ -235,11 +301,15 @@ async fn process_announce_queue(
             return;
         };
 
-        send_or_drop(&tx_send, message).await;
+        send_or_drop(&tx_send, message, Some(&saturated_queue_logger)).await;
     }
 }
 
-async fn send_or_drop(tx_send: &InterfaceTxSender, message: TxMessage) {
+async fn send_or_drop(
+    tx_send: &InterfaceTxSender,
+    message: TxMessage,
+    saturated_queue_logger: Option<&SaturatedQueueLogger>,
+) {
     match tx_send.try_send(message) {
         Ok(()) => {}
         Err(TrySendError::Full(message)) => {
@@ -248,10 +318,14 @@ async fn send_or_drop(tx_send: &InterfaceTxSender, message: TxMessage) {
                 .await
                 .is_err()
             {
-                log::warn!(
-                    "iface: dropping outbound packet for saturated interface queue tx_type={:?}",
-                    tx_type
-                );
+                if let Some(logger) = saturated_queue_logger {
+                    logger.warn_drop(tx_type).await;
+                } else {
+                    log::warn!(
+                        "iface: dropping outbound packet for saturated interface queue tx_type={:?}",
+                        tx_type
+                    );
+                }
             }
         }
         Err(TrySendError::Closed(_)) => {
@@ -314,6 +388,7 @@ impl InterfaceManager {
             tx_send,
             stop: stop.clone(),
             announce_pacer,
+            saturated_queue_logger: SaturatedQueueLogger::new(address),
             shared_instance_client,
         });
 
@@ -426,10 +501,20 @@ impl InterfaceManager {
                     .filter(|_| AnnouncePacer::should_pace(&message))
                 {
                     pacer
-                        .send(iface.tx_send.clone(), iface.stop.clone(), message.clone())
+                        .send(
+                            iface.tx_send.clone(),
+                            iface.stop.clone(),
+                            iface.saturated_queue_logger.clone(),
+                            message.clone(),
+                        )
                         .await;
                 } else {
-                    send_or_drop(&iface.tx_send, message.clone()).await;
+                    send_or_drop(
+                        &iface.tx_send,
+                        message.clone(),
+                        Some(&iface.saturated_queue_logger),
+                    )
+                    .await;
                 }
             }
         }

@@ -79,11 +79,11 @@ impl TcpClient {
                         _ = context.cancel.cancelled() => {
                             break;
                         }
-                        Some(_) = tx_channel.recv() => {
-                            continue;
-                        }
                         result = TcpStream::connect(addr.clone()) => {
                             result.map_err(|_| RnsError::ConnectionError)
+                        }
+                        Some(_) = tx_channel.recv() => {
+                            continue;
                         }
                     }
                 }
@@ -107,10 +107,10 @@ impl TcpClient {
                         _ = context.cancel.cancelled() => {
                             break 'outer;
                         }
-                        Some(_) = tx_channel.recv() => {}
                         _ = tokio::time::sleep_until(retry_at) => {
                             break;
                         }
+                        Some(_) = tx_channel.recv() => {}
                     }
                 }
                 continue;

@@ -24,6 +24,7 @@
 //! * [`iface::tcp_client::TcpClient`]
 //! * [`iface::tcp_server::TcpServer`]
 //! * [`iface::udp::UdpInterface`]
+//! * [`iface::modem73::Modem73Interface`]
 //! * Kaonic
 //!
 //! The main instance can be used to send messages to [`destination::Destination`]s directly

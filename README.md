@@ -34,6 +34,7 @@ Reticulum operates independently of traditional IP, and can function effectively
 * ❌ SerialInterface
 * ❌ PipeInterface
 * ✅ KISSInterface
+* ✅ [Modem73Interface](https://github.com/RFnexus/modem73)
 * ❌ AX25KISSInterface
 
 ## Usage

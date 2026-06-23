@@ -1,5 +1,6 @@
 pub mod hdlc;
 pub mod kiss;
+pub mod modem73;
 pub mod rnode;
 pub mod tcp_client;
 pub mod tcp_server;

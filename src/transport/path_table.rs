@@ -43,6 +43,10 @@ impl PathTable {
         self.map.get(destination)
     }
 
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
     pub fn next_hop_full(&self, destination: &AddressHash) -> Option<(AddressHash, AddressHash)> {
         self.map
             .get(destination)

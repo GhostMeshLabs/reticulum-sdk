@@ -166,6 +166,15 @@ pub enum SharedInstanceType {
     Unix,
 }
 
+/// Snapshot of transport metrics intended for external collection.
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
+pub struct TransportMetrics {
+    /// Interface queue depth metrics.
+    pub interface_queues: InterfaceQueueLengths,
+    /// Number of entries currently known in the path table.
+    pub path_table_entries: usize,
+}
+
 struct TransportHandler {
     config: TransportConfig,
     iface_manager: Arc<Mutex<InterfaceManager>>,
@@ -498,6 +507,22 @@ impl Transport {
 
     pub async fn interface_queue_lengths(&self) -> InterfaceQueueLengths {
         self.iface_manager.lock().await.queue_lengths().await
+    }
+
+    /// Returns the current number of path table entries.
+    pub async fn path_table_len(&self) -> usize {
+        self.handler.lock().await.path_table.len()
+    }
+
+    /// Returns a metrics snapshot for transport-level collectors.
+    pub async fn metrics(&self) -> TransportMetrics {
+        let path_table_entries = self.path_table_len().await;
+        let interface_queues = self.interface_queue_lengths().await;
+
+        TransportMetrics {
+            interface_queues,
+            path_table_entries,
+        }
     }
 
     pub fn iface_rx(&self) -> broadcast::Receiver<RxMessage> {
@@ -3516,6 +3541,27 @@ mod tests {
                 .is_some(),
             "path response should still populate the path table",
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_report_path_table_entry_count() {
+        let transport = Transport::new(Default::default());
+        let handler = transport.get_handler();
+        let remote_destination = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(OsRng),
+            DestinationName::new("example_utilities", "metrics.path"),
+        );
+        let announce = remote_destination
+            .announce(OsRng, None)
+            .expect("valid announce");
+        let iface = AddressHash::new_from_rand(OsRng);
+
+        assert_eq!(transport.path_table_len().await, 0);
+
+        handle_announce(&announce, handler.lock().await, iface).await;
+
+        assert_eq!(transport.path_table_len().await, 1);
+        assert_eq!(transport.metrics().await.path_table_entries, 1);
     }
 
     #[tokio::test]

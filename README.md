@@ -11,8 +11,7 @@ Reticulum operates independently of traditional IP, and can function effectively
 
 ## Implemented protocol features
 
-> Features implemented from the core Reticulum Protocol
-
+* ✅ experimental TCP RPC control port (aka share_instance)
 * ✅ rnstransport path.request
 * ✅ rnstransport probe (aka respond_to_probes)
 * ✅ rnstransport discovery (aka discoverable)
@@ -23,19 +22,28 @@ Reticulum operates independently of traditional IP, and can function effectively
 
 > Physical communication interfaces implemented
 
-* ✅ TCPServerInterface
-* ✅ TCPClientInterface
-* ✅ UDPInterface
+### IP Network (LAN, WAN)
+
 * ❌ AutoInterface
-* ❌ BackboneInterface
+* ❌ BackboneInterface (Use TCPServerInterface instead for now)
 * ❌ I2PInterface
-* ❌ RNodeMultiInterface
-* ✅ RNodeInterface (over Serial)
-* ❌ SerialInterface
-* ❌ PipeInterface
-* ✅ KISSInterface
-* ✅ [Modem73Interface](https://github.com/RFnexus/modem73)
+* ✅ TCPClientInterface
+* ✅ TCPServerInterface (bind_host ::1 will allow dual-stack functionality)
+* ✅ UDPInterface
+
+### Radio (HAM, LoRA)
+
 * ❌ AX25KISSInterface
+* ✅ [Modem73Interface](https://github.com/RFnexus/modem73)
+* ✅ [RNodeInterface](https://unsigned.io/rnode/) (over Serial)
+* ❌ RNodeMultiInterface
+* ❌ KISSInterface
+
+### Other
+
+* ❌ BluetoothInterface
+* ❌ PipeInterface
+* ❌ SerialInterface
 
 ## Usage
 
@@ -49,6 +57,14 @@ cargo build
 
 ```
 cargo test
+```
+
+### Using it in Rust
+
+Cargo.toml
+```toml
+[dependencies]
+reticulum-sdk = "2.0.0"
 ```
 
 ## Implementations

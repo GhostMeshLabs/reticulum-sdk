@@ -1753,9 +1753,7 @@ impl TransportHandler {
         let mut allow_duplicate = false;
 
         match packet.header.packet_type {
-            PacketType::Announce => {
-                return true;
-            }
+            PacketType::Announce => {}
             PacketType::LinkRequest => {
                 allow_duplicate = true;
             }
@@ -1771,7 +1769,6 @@ impl TransportHandler {
                     }
                 }
             }
-            _ => {}
         }
 
         let is_new = self.packet_cache.lock().await.update(packet);
@@ -3298,8 +3295,6 @@ mod tests {
         let transport = Transport::new(config);
         let handler = transport.get_handler();
 
-        let source1 = AddressHash::new_from_slice(&[1u8; 32]);
-        let source2 = AddressHash::new_from_slice(&[2u8; 32]);
         let next_hop_iface = AddressHash::new_from_slice(&[3u8; 32]);
         let destination = AddressHash::new_from_slice(&[4u8; 32]);
 
@@ -3316,13 +3311,20 @@ mod tests {
                 .filter_duplicate_packets(&announce)
                 .await
         );
+        assert!(
+            !handler
+                .lock()
+                .await
+                .filter_duplicate_packets(&announce)
+                .await
+        );
 
         handle_announce(&announce, handler.lock().await, next_hop_iface).await;
 
         let mut data_packet: Packet = Default::default();
         data_packet.data = PacketDataBuffer::new_from_slice(b"foo");
         data_packet.destination = destination;
-        let mut duplicate: Packet = data_packet.clone();
+        let duplicate: Packet = data_packet.clone();
 
         let mut different_packet = data_packet.clone();
         different_packet.data = PacketDataBuffer::new_from_slice(b"bar");

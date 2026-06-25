@@ -222,8 +222,8 @@ impl EncryptIdentity for Identity {
         }
 
         let token = Fernet::new_from_slices(
-            &derived_key.as_bytes()[..16],
-            &derived_key.as_bytes()[16..],
+            &derived_key.as_bytes()[..DERIVED_KEY_LENGTH / 2],
+            &derived_key.as_bytes()[DERIVED_KEY_LENGTH / 2..],
             rng,
         )
         .encrypt(PlainText::from(text), &mut out_buf[out_offset..])?;

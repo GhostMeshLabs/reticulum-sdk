@@ -3,7 +3,7 @@ pub mod link_map;
 
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey, SIGNATURE_LENGTH};
 use rand_core::{CryptoRngCore, OsRng};
-use x25519_dalek::PublicKey;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 use core::{fmt, marker::PhantomData};
 
@@ -215,6 +215,7 @@ pub struct Destination<I: HashIdentity, D: Direction, T: Type> {
     pub desc: DestinationDesc,
     accept_link_requests: bool,
     prove_packets: bool,
+    ratchet_secret: Option<StaticSecret>,
 }
 
 impl<I: HashIdentity, D: Direction, T: Type> Destination<I, D, T> {
@@ -272,6 +273,10 @@ impl Destination<PrivateIdentity, Input, Single> {
             .chain_safe_write(self.desc.name.as_name_hash_slice())
             .chain_safe_write(rand_hash);
 
+        if let Some(ratchet_key) = self.desc.ratchet_public_key {
+            packet_data.chain_safe_write(&ratchet_key);
+        }
+
         if let Some(data) = app_data {
             packet_data.write(data)?;
         }
@@ -284,8 +289,13 @@ impl Destination<PrivateIdentity, Input, Single> {
             .chain_safe_write(pub_key)
             .chain_safe_write(verifying_key)
             .chain_safe_write(self.desc.name.as_name_hash_slice())
-            .chain_safe_write(rand_hash)
-            .chain_safe_write(&signature.to_bytes());
+            .chain_safe_write(rand_hash);
+
+        if let Some(ratchet_key) = self.desc.ratchet_public_key {
+            packet_data.chain_safe_write(&ratchet_key);
+        }
+
+        packet_data.chain_safe_write(&signature.to_bytes());
 
         if let Some(data) = app_data {
             packet_data.write(data)?;
@@ -326,7 +336,15 @@ impl Destination<PrivateIdentity, Input, Single> {
             },
             accept_link_requests: true,
             prove_packets: false,
+            ratchet_secret: None,
         }
+    }
+
+    pub fn enable_ratchet<R: CryptoRngCore>(&mut self, rng: &mut R) {
+        let secret = StaticSecret::random_from_rng(rng);
+        let public = PublicKey::from(&secret);
+        self.desc.ratchet_public_key = Some(public.to_bytes());
+        self.ratchet_secret = Some(secret);
     }
 
     pub fn announce<R: CryptoRngCore + Copy>(
@@ -342,7 +360,11 @@ impl Destination<PrivateIdentity, Input, Single> {
             header: Header {
                 ifac_flag: IfacFlag::Open,
                 header_type: HeaderType::Type1,
-                context_flag: ContextFlag::Unset,
+                context_flag: if self.desc.ratchet_public_key.is_some() {
+                    ContextFlag::Set
+                } else {
+                    ContextFlag::Unset
+                },
                 propagation_type: PropagationType::Broadcast,
                 destination_type: DestinationType::Single,
                 packet_type: PacketType::Announce,
@@ -379,7 +401,11 @@ impl Destination<PrivateIdentity, Input, Single> {
             header: Header {
                 ifac_flag: IfacFlag::Open,
                 header_type: HeaderType::Type1,
-                context_flag: ContextFlag::Unset,
+                context_flag: if self.desc.ratchet_public_key.is_some() {
+                    ContextFlag::Set
+                } else {
+                    ContextFlag::Unset
+                },
                 propagation_type: PropagationType::Broadcast,
                 destination_type: DestinationType::Single,
                 packet_type: PacketType::Announce,
@@ -407,7 +433,11 @@ impl Destination<PrivateIdentity, Input, Single> {
             header: Header {
                 ifac_flag: IfacFlag::Open,
                 header_type: HeaderType::Type1,
-                context_flag: ContextFlag::Unset,
+                context_flag: if self.desc.ratchet_public_key.is_some() {
+                    ContextFlag::Set
+                } else {
+                    ContextFlag::Unset
+                },
                 propagation_type: PropagationType::Broadcast,
                 destination_type: DestinationType::Single,
                 packet_type: PacketType::Announce,
@@ -500,6 +530,7 @@ impl Destination<Identity, Output, Single> {
             },
             accept_link_requests: false,
             prove_packets: false,
+            ratchet_secret: None,
         }
     }
 
@@ -511,6 +542,7 @@ impl Destination<Identity, Output, Single> {
             desc,
             accept_link_requests: false,
             prove_packets: false,
+            ratchet_secret: None,
         }
     }
 
@@ -573,6 +605,7 @@ impl<D: Direction> Destination<EmptyIdentity, D, Plain> {
             },
             accept_link_requests: false,
             prove_packets: false,
+            ratchet_secret: None,
         }
     }
 }

@@ -1,23 +1,23 @@
 use alloc::sync::Arc;
 use announce_limits::AnnounceLimits;
 use announce_table::AnnounceTable;
+use discovery::DISCOVERY_JOB_INTERVAL;
+use discovery::RegisteredDiscoveryInterface;
 use discovery::create_discovery_destination;
 use discovery::is_discovery_destination;
-use discovery::RegisteredDiscoveryInterface;
-use discovery::DISCOVERY_JOB_INTERVAL;
 use hmac::{Hmac, Mac};
 use link_table::LinkTable;
 use packet_cache::PacketCache;
-use path_requests::create_path_request_destination;
 use path_requests::PathRequests;
 use path_requests::TagBytes;
+use path_requests::create_path_request_destination;
 use path_table::PathTable;
 use rand_core::OsRng;
 use rand_core::RngCore;
 use reverse_table::ReverseTable;
-use rmpv::{decode::read_value, encode::write_value, Value};
+use rmpv::{Value, decode::read_value, encode::write_value};
 use sha2::Sha256;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::TcpListener as StdTcpListener;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -25,21 +25,21 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 use tokio::sync::MutexGuard;
+use tokio::sync::broadcast;
 
-use crate::destination::link::Link;
-use crate::destination::link::LinkEventData;
-use crate::destination::link::LinkHandleResult;
-use crate::destination::link::LinkId;
-use crate::destination::link::LinkStatus;
 use crate::destination::DestinationAnnounce;
 use crate::destination::DestinationDesc;
 use crate::destination::DestinationHandleStatus;
 use crate::destination::DestinationName;
 use crate::destination::SingleInputDestination;
 use crate::destination::SingleOutputDestination;
+use crate::destination::link::Link;
+use crate::destination::link::LinkEventData;
+use crate::destination::link::LinkHandleResult;
+use crate::destination::link::LinkId;
+use crate::destination::link::LinkStatus;
 
 use crate::error::RnsError;
 
@@ -47,13 +47,13 @@ use crate::hash::AddressHash;
 use crate::hash::Hash;
 use crate::identity::PrivateIdentity;
 
-use crate::iface::tcp_client::TcpClient;
 use crate::iface::InterfaceManager;
 use crate::iface::InterfaceQueueLengths;
 use crate::iface::InterfaceRxReceiver;
 use crate::iface::RxMessage;
 use crate::iface::TxMessage;
 use crate::iface::TxMessageType;
+use crate::iface::tcp_client::TcpClient;
 
 use crate::packet::DestinationType;
 use crate::packet::Header;
@@ -2831,6 +2831,17 @@ async fn manage_transport(
 
                         handler.link_table.remove_stale();
                         handler.reverse_table.remove_stale(INTERVAL_KEEP_REVERSE_PATH);
+
+                        let active_ifaces: HashSet<AddressHash> = handler
+                            .iface_manager
+                            .lock()
+                            .await
+                            .active_interface_addresses()
+                            .into_iter()
+                            .collect();
+                        handler
+                            .path_table
+                            .remove_stale(|iface| active_ifaces.contains(iface));
                     },
                 }
             }

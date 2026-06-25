@@ -47,6 +47,34 @@ impl PathTable {
         self.map.len()
     }
 
+    pub fn remove_stale<F>(&mut self, mut is_active_iface: F) -> usize
+    where
+        F: FnMut(&AddressHash) -> bool,
+    {
+        let now = Instant::now();
+        let initial_len = self.map.len();
+
+        self.map.retain(|destination, entry| {
+            if now >= entry.expires {
+                log::debug!("path_table removed expired path to {}", destination);
+                return false;
+            }
+
+            if !is_active_iface(&entry.iface) {
+                log::debug!(
+                    "path_table removed path to {} because interface {} is no longer active",
+                    destination,
+                    entry.iface
+                );
+                return false;
+            }
+
+            true
+        });
+
+        initial_len - self.map.len()
+    }
+
     pub fn next_hop_full(&self, destination: &AddressHash) -> Option<(AddressHash, AddressHash)> {
         self.map
             .get(destination)
@@ -192,6 +220,7 @@ self_referential_transport={}",
     pub fn refresh(&mut self, destination: &AddressHash) {
         if let Some(entry) = self.map.get_mut(destination) {
             entry.timestamp = Instant::now();
+            entry.expires = entry.timestamp + PATHFINDER_E;
         }
     }
 
@@ -336,6 +365,7 @@ mod tests {
             PacketType, PropagationType,
         },
     };
+    use std::time::Instant;
 
     #[test]
     fn direct_path_forwarding_strips_transport_header() {
@@ -471,6 +501,84 @@ mod tests {
         let (_, forwarded_iface) = table.handle_inbound_packet(&original, None);
 
         assert_eq!(forwarded_iface, None);
+    }
+
+    #[test]
+    fn removes_expired_paths() {
+        let destination = AddressHash::new_from_slice(b"expired-destination");
+        let iface = AddressHash::new_from_slice(b"expired-iface");
+        let mut table = PathTable::new(false);
+
+        let announce = Packet {
+            header: Header {
+                packet_type: PacketType::Announce,
+                destination_type: DestinationType::Single,
+                ..Default::default()
+            },
+            destination,
+            transport: None,
+            context: PacketContext::None,
+            ifac: None,
+            data: Default::default(),
+        };
+
+        table.handle_announce(&announce, None, iface);
+        table.map.get_mut(&destination).unwrap().expires = Instant::now();
+
+        assert_eq!(table.remove_stale(|_| true), 1);
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn removes_paths_for_inactive_interfaces() {
+        let destination = AddressHash::new_from_slice(b"inactive-iface-destination");
+        let iface = AddressHash::new_from_slice(b"inactive-iface");
+        let mut table = PathTable::new(false);
+
+        let announce = Packet {
+            header: Header {
+                packet_type: PacketType::Announce,
+                destination_type: DestinationType::Single,
+                ..Default::default()
+            },
+            destination,
+            transport: None,
+            context: PacketContext::None,
+            ifac: None,
+            data: Default::default(),
+        };
+
+        table.handle_announce(&announce, None, iface);
+
+        assert_eq!(table.remove_stale(|_| false), 1);
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn refreshed_paths_are_not_removed_as_expired() {
+        let destination = AddressHash::new_from_slice(b"refreshed-destination");
+        let iface = AddressHash::new_from_slice(b"refreshed-iface");
+        let mut table = PathTable::new(false);
+
+        let announce = Packet {
+            header: Header {
+                packet_type: PacketType::Announce,
+                destination_type: DestinationType::Single,
+                ..Default::default()
+            },
+            destination,
+            transport: None,
+            context: PacketContext::None,
+            ifac: None,
+            data: Default::default(),
+        };
+
+        table.handle_announce(&announce, None, iface);
+        table.map.get_mut(&destination).unwrap().expires = Instant::now();
+        table.refresh(&destination);
+
+        assert_eq!(table.remove_stale(|active_iface| *active_iface == iface), 0);
+        assert_eq!(table.len(), 1);
     }
 
     fn random_blob(prefix: u8, emitted: u64) -> [u8; super::RAND_HASH_LENGTH] {

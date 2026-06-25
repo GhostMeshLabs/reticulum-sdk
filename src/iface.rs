@@ -16,9 +16,9 @@ use tokio::task;
 use tokio::time::{self, Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
+use crate::hash::ADDRESS_HASH_SIZE;
 use crate::hash::AddressHash;
 use crate::hash::Hash;
-use crate::hash::ADDRESS_HASH_SIZE;
 use crate::packet::{HeaderType, Packet, PacketType};
 
 pub type InterfaceTxSender = mpsc::Sender<TxMessage>;
@@ -527,6 +527,14 @@ impl InterfaceManager {
 
     pub fn cleanup(&mut self) {
         self.ifaces.retain(|iface| !iface.stop.is_cancelled());
+    }
+
+    pub fn active_interface_addresses(&self) -> Vec<AddressHash> {
+        self.ifaces
+            .iter()
+            .filter(|iface| !iface.stop.is_cancelled())
+            .map(|iface| iface.address)
+            .collect()
     }
 
     pub fn shared_instance_clients_except(&self, address: AddressHash) -> Vec<AddressHash> {

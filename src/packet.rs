@@ -31,7 +31,7 @@ const fn encrypted_payload_mdu(header_size: usize, cleartext_overhead: usize) ->
         - header_size
         - RETICULUM_TOKEN_OVERHEAD
         - cleartext_overhead;
-    (available / RETICULUM_AES_BLOCK_SIZE) * RETICULUM_AES_BLOCK_SIZE - 1
+    ((available / RETICULUM_AES_BLOCK_SIZE) * RETICULUM_AES_BLOCK_SIZE).saturating_sub(1)
 }
 
 /// Compute a link's per-packet Maximum Data Unit from a negotiated path MTU.
@@ -42,7 +42,7 @@ pub fn compute_link_mdu(mtu: usize) -> usize {
         .saturating_sub(RETICULUM_MIN_IFAC_SIZE)
         .saturating_sub(RETICULUM_HEADER_MINSIZE)
         .saturating_sub(RETICULUM_TOKEN_OVERHEAD);
-    (available / RETICULUM_AES_BLOCK_SIZE) * RETICULUM_AES_BLOCK_SIZE - 1
+    ((available / RETICULUM_AES_BLOCK_SIZE) * RETICULUM_AES_BLOCK_SIZE).saturating_sub(1)
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]

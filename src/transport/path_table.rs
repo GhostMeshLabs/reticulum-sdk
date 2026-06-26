@@ -244,16 +244,26 @@ self_referential_transport={}",
             None => return (packet, None),
         };
 
+        let (header_type, propagation_type, transport) = if entry.hops > 1 {
+            (
+                HeaderType::Type2,
+                PropagationType::Transport,
+                Some(entry.received_from),
+            )
+        } else {
+            (HeaderType::Type1, PropagationType::Broadcast, None)
+        };
+
         (
             Packet {
                 header: Header {
-                    header_type: HeaderType::Type2,
-                    propagation_type: PropagationType::Transport,
+                    header_type,
+                    propagation_type,
                     ..packet.header
                 },
                 ifac: packet.ifac,
                 destination: packet.destination,
-                transport: Some(entry.received_from),
+                transport,
                 context: packet.context,
                 data: packet.data.clone(),
             },

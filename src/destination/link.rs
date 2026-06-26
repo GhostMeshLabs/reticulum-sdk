@@ -573,6 +573,7 @@ impl Link {
 
                     self.status = LinkStatus::Active;
                     self.rtt = self.request_time.elapsed();
+                    self.mark_activity();
 
                     log::debug!("link({}): activated", self.id);
 
@@ -831,6 +832,10 @@ impl Link {
 
     pub fn destination(&self) -> &DestinationDesc {
         &self.destination
+    }
+
+    pub fn mark_activity(&mut self) {
+        self.request_time = Instant::now();
     }
 
     pub fn create_rtt(&self) -> Packet {

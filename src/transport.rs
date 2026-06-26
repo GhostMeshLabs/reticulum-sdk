@@ -87,10 +87,10 @@ const PACKET_TRACE: bool = false;
 pub const PATHFINDER_M: usize = 128; // Max hops
 
 const INTERVAL_LINKS_CHECK: Duration = Duration::from_secs(1);
-const INTERVAL_INPUT_LINK_STALE: Duration = Duration::from_secs(10);
+const INTERVAL_INPUT_LINK_STALE: Duration = Duration::from_secs(720);
 const INTERVAL_INPUT_LINK_CLOSE: Duration = Duration::from_secs(5);
 const INTERVAL_OUTPUT_LINK_RESTART: Duration = Duration::from_secs(60);
-const INTERVAL_OUTPUT_LINK_STALE: Duration = Duration::from_secs(10);
+const INTERVAL_OUTPUT_LINK_STALE: Duration = Duration::from_secs(720);
 const INTERVAL_OUTPUT_LINK_CLOSE: Duration = Duration::from_secs(5);
 const INTERVAL_OUTPUT_LINK_REPEAT: Duration = Duration::from_secs(6);
 const INTERVAL_OUTPUT_LINK_KEEP: Duration = Duration::from_secs(5);
@@ -2638,12 +2638,13 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
 
 async fn handle_keep_links<'a>(handler: MutexGuard<'a, TransportHandler>) {
     for link in handler.out_links.values() {
-        let link = link.lock().await;
+        let mut link = link.lock().await;
 
         if link.status() == LinkStatus::Active {
             handler
                 .send_packet(link.keep_alive_packet(KEEP_ALIVE_REQUEST))
                 .await;
+            link.mark_activity();
         }
     }
 }

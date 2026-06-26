@@ -692,4 +692,227 @@ mod tests {
         assert_eq!(iface, second_iface);
         assert_eq!(hops, 2);
     }
+
+    #[test]
+    fn outbound_direct_path_uses_type1_broadcast() {
+        let destination = AddressHash::new_from_slice(b"outbound-direct");
+        let iface = AddressHash::new_from_slice(b"outbound-iface");
+        let mut table = PathTable::new(false);
+
+        let announce = Packet {
+            header: Header {
+                packet_type: PacketType::Announce,
+                destination_type: DestinationType::Single,
+                hops: 0,
+                ..Default::default()
+            },
+            destination,
+            transport: None,
+            context: PacketContext::None,
+            ifac: None,
+            data: Default::default(),
+        };
+        table.handle_announce(&announce, None, iface);
+
+        let packet = Packet {
+            header: Header {
+                packet_type: PacketType::LinkRequest,
+                destination_type: DestinationType::Single,
+                hops: 0,
+                ..Default::default()
+            },
+            destination,
+            transport: None,
+            context: PacketContext::None,
+            ifac: None,
+            data: Default::default(),
+        };
+
+        let (forwarded, forwarded_iface) = table.handle_packet(packet);
+
+        assert_eq!(forwarded_iface, Some(iface));
+        assert_eq!(forwarded.header.header_type, HeaderType::Type1);
+        assert_eq!(
+            forwarded.header.propagation_type,
+            PropagationType::Broadcast
+        );
+        assert_eq!(forwarded.transport, None);
+        assert_eq!(forwarded.header.hops, 0);
+    }
+
+    #[test]
+    fn outbound_multihop_path_uses_type2_transport() {
+        let destination = AddressHash::new_from_slice(b"outbound-remote");
+        let next_hop = AddressHash::new_from_slice(b"outbound-next-hop");
+        let iface = AddressHash::new_from_slice(b"outbound-iface");
+        let mut table = PathTable::new(false);
+
+        let announce = Packet {
+            header: Header {
+                header_type: HeaderType::Type2,
+                packet_type: PacketType::Announce,
+                destination_type: DestinationType::Single,
+                hops: 1,
+                ..Default::default()
+            },
+            destination,
+            transport: Some(next_hop),
+            context: PacketContext::None,
+            ifac: None,
+            data: Default::default(),
+        };
+        table.handle_announce(&announce, Some(next_hop), iface);
+
+        let packet = Packet {
+            header: Header {
+                packet_type: PacketType::LinkRequest,
+                destination_type: DestinationType::Single,
+                hops: 0,
+                ..Default::default()
+            },
+            destination,
+            transport: None,
+            context: PacketContext::None,
+            ifac: None,
+            data: Default::default(),
+        };
+
+        let (forwarded, forwarded_iface) = table.handle_packet(packet);
+
+        assert_eq!(forwarded_iface, Some(iface));
+        assert_eq!(forwarded.header.header_type, HeaderType::Type2);
+        assert_eq!(
+            forwarded.header.propagation_type,
+            PropagationType::Transport
+        );
+        assert_eq!(forwarded.transport, Some(next_hop));
+        assert_eq!(forwarded.header.hops, 0);
+    }
+
+    #[test]
+    fn outbound_no_path_falls_back_to_broadcast() {
+        let destination = AddressHash::new_from_slice(b"outbound-unknown");
+        let table = PathTable::new(false);
+
+        let packet = Packet {
+            header: Header {
+                packet_type: PacketType::LinkRequest,
+                destination_type: DestinationType::Single,
+                hops: 0,
+                ..Default::default()
+            },
+            destination,
+            transport: Some(AddressHash::new_from_slice(b"stale-transport")),
+            context: PacketContext::None,
+            ifac: None,
+            data: Default::default(),
+        };
+
+        let (forwarded, forwarded_iface) = table.handle_packet(packet);
+
+        assert_eq!(forwarded_iface, None);
+        assert_eq!(forwarded.header.header_type, HeaderType::Type1);
+        assert_eq!(forwarded.transport, Some(AddressHash::new_from_slice(b"stale-transport")));
+    }
+
+    #[test]
+    fn outbound_type2_packet_passthrough() {
+        let destination = AddressHash::new_from_slice(b"outbound-type2-dst");
+        let table = PathTable::new(false);
+
+        let packet = Packet {
+            header: Header {
+                header_type: HeaderType::Type2,
+                packet_type: PacketType::LinkRequest,
+                destination_type: DestinationType::Single,
+                hops: 0,
+                ..Default::default()
+            },
+            destination,
+            transport: None,
+            context: PacketContext::None,
+            ifac: None,
+            data: Default::default(),
+        };
+
+        let (forwarded, forwarded_iface) = table.handle_packet(packet);
+
+        assert_eq!(forwarded_iface, None);
+        assert_eq!(forwarded.header.header_type, HeaderType::Type2);
+    }
+
+    #[test]
+    fn outbound_announce_packet_passthrough() {
+        let destination = AddressHash::new_from_slice(b"outbound-announce");
+        let table = PathTable::new(false);
+
+        let packet = Packet {
+            header: Header {
+                packet_type: PacketType::Announce,
+                destination_type: DestinationType::Single,
+                hops: 0,
+                ..Default::default()
+            },
+            destination,
+            transport: None,
+            context: PacketContext::None,
+            ifac: None,
+            data: Default::default(),
+        };
+
+        let (forwarded, forwarded_iface) = table.handle_packet(packet);
+
+        assert_eq!(forwarded_iface, None);
+        assert_eq!(forwarded.header.header_type, HeaderType::Type1);
+    }
+
+    #[test]
+    fn outbound_plain_destination_passthrough() {
+        let destination = AddressHash::new_from_slice(b"outbound-plain");
+        let table = PathTable::new(false);
+
+        let packet = Packet {
+            header: Header {
+                packet_type: PacketType::Data,
+                destination_type: DestinationType::Plain,
+                hops: 0,
+                ..Default::default()
+            },
+            destination,
+            transport: None,
+            context: PacketContext::None,
+            ifac: None,
+            data: Default::default(),
+        };
+
+        let (forwarded, forwarded_iface) = table.handle_packet(packet);
+
+        assert_eq!(forwarded_iface, None);
+        assert_eq!(forwarded.header.destination_type, DestinationType::Plain);
+    }
+
+    #[test]
+    fn outbound_group_destination_passthrough() {
+        let destination = AddressHash::new_from_slice(b"outbound-group");
+        let table = PathTable::new(false);
+
+        let packet = Packet {
+            header: Header {
+                packet_type: PacketType::Data,
+                destination_type: DestinationType::Group,
+                hops: 0,
+                ..Default::default()
+            },
+            destination,
+            transport: None,
+            context: PacketContext::None,
+            ifac: None,
+            data: Default::default(),
+        };
+
+        let (forwarded, forwarded_iface) = table.handle_packet(packet);
+
+        assert_eq!(forwarded_iface, None);
+        assert_eq!(forwarded.header.destination_type, DestinationType::Group);
+    }
 }

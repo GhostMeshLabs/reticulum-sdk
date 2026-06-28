@@ -1,10 +1,10 @@
 [package]
 name = "reticulum-sdk"
-version = "2.0.7"
+version = "2.0.8"
 edition = "2024"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/GhostMeshLabs/reticulum-sdk"
+repository = "https://github.com/ReticulaLabs/reticulum-sdk"
 categories = ["network-programming"]
 keywords = ["reticulum", "mesh", "radio", "async"]
 

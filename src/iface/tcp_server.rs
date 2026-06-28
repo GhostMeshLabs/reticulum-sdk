@@ -1,5 +1,6 @@
 use alloc::string::String;
 use std::net::TcpListener as StdTcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
@@ -16,6 +17,7 @@ pub struct TcpServer {
     listener: Option<StdTcpListener>,
     accept_trace_label: Option<String>,
     bitrate: Option<f64>,
+    max_connections: Option<usize>,
 }
 
 impl TcpServer {
@@ -29,6 +31,7 @@ impl TcpServer {
             listener: None,
             accept_trace_label: None,
             bitrate: None,
+            max_connections: Some(128),
         }
     }
 
@@ -43,11 +46,22 @@ impl TcpServer {
             listener: Some(listener),
             accept_trace_label: None,
             bitrate: None,
+            max_connections: Some(128),
         }
     }
 
     pub fn with_bitrate(mut self, bitrate: f64) -> Self {
         self.bitrate = configured_bitrate(bitrate);
+        self
+    }
+
+    pub fn with_max_connections(mut self, n: usize) -> Self {
+        self.max_connections = Some(n);
+        self
+    }
+
+    pub fn without_max_connections(mut self) -> Self {
+        self.max_connections = None;
         self
     }
 
@@ -63,6 +77,7 @@ impl TcpServer {
         let mut listener = { context.inner.lock().unwrap().listener.take() };
         let accept_trace_label = { context.inner.lock().unwrap().accept_trace_label.clone() };
         let bitrate = { context.inner.lock().unwrap().bitrate };
+        let max_connections = { context.inner.lock().unwrap().max_connections };
 
         let (_, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
@@ -119,10 +134,22 @@ impl TcpServer {
             };
 
             let cancel = context.cancel.clone();
+            let active_connections = Arc::new(AtomicUsize::new(0));
 
             loop {
                 if cancel.is_cancelled() {
                     break;
+                }
+
+                if let Some(max) = max_connections {
+                    if active_connections.load(Ordering::Relaxed) >= max {
+                        log::warn!(
+                            "tcp_server: max connections ({}) reached, waiting for a slot",
+                            max,
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
                 }
 
                 tokio::select! {
@@ -146,12 +173,17 @@ impl TcpServer {
                                 addr
                             );
 
+                            active_connections.fetch_add(1, Ordering::Relaxed);
+                            let connections = active_connections.clone();
                             let mut iface_manager = iface_manager.lock().await;
 
                             iface_manager.spawn(
                                 TcpClient::new_from_stream(client.1.to_string(), client.0)
                                     .with_optional_bitrate(bitrate),
-                                TcpClient::spawn,
+                                |context| async move {
+                                    TcpClient::spawn(context).await;
+                                    connections.fetch_sub(1, Ordering::Relaxed);
+                                },
                             );
                         }
                     }

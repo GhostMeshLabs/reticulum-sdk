@@ -32,10 +32,14 @@ pub type InterfaceRxReceiver = mpsc::Receiver<RxMessage>;
 // interoperable Reticulum packet MTU. Fast interfaces can negotiate higher
 // effective transfer sizes later, but the base packet wire format remains 500
 // bytes. These constants model interface capacity rather than packet format.
+//
+// TODO: some of these (such as INTERFACE_TX_QUEUE_CAP could become
+// configuration items as reticulum grows. The unlimited max of the Python
+// implementation isn't great from a security standpoint.
 pub const DEFAULT_HW_MTU: usize = 2048;
 pub const MAX_AUTOCONFIGURED_HW_MTU: usize = 524_288;
 const DEFAULT_ANNOUNCE_CAP: f64 = 0.02;
-const DEFAULT_INTERFACE_TX_QUEUE_CAP: usize = 128;
+const DEFAULT_INTERFACE_TX_QUEUE_CAP: usize = 16_384;
 const MAX_QUEUED_ANNOUNCES: usize = 16_384;
 const INTERFACE_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const SATURATED_QUEUE_LOG_INTERVAL: Duration = Duration::from_secs(10);

@@ -94,6 +94,47 @@ async fn discovery_announce_roundtrip() {
 }
 
 #[tokio::test]
+async fn backbone_discovery_announce_roundtrip() {
+    setup();
+
+    let listener_a = local_tcp_listener();
+    let listener_b = local_tcp_listener();
+    let addr_a = listener_a.local_addr().unwrap().to_string();
+    let port_a = listener_a.local_addr().unwrap().port();
+
+    let (transport_a, server_iface_a) = build_transport("a", listener_a, &[]).await;
+    let (transport_b, _server_iface_b) = build_transport("b", listener_b, &[addr_a.as_str()]).await;
+
+    transport_a
+        .register_discoverable_interface(
+            server_iface_a,
+            DiscoveryInterfaceConfig::backbone("Backbone Test", "10.0.0.1", port_a),
+        )
+        .await;
+
+    let mut discovery_rx = transport_b.recv_discovery();
+
+    time::sleep(Duration::from_secs(2)).await;
+    transport_a
+        .send_discovery_announce(&server_iface_a)
+        .await
+        .unwrap();
+
+    let discovered = time::timeout(Duration::from_secs(10), discovery_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(discovered.interface_type, "BackboneInterface");
+    assert_eq!(discovered.name, "Backbone Test");
+    assert_eq!(discovered.reachable_on.as_deref(), Some("10.0.0.1"));
+    assert_eq!(discovered.port, Some(port_a));
+    assert!(discovered.stamp_value >= 14);
+    assert!(discovered.config_entry.is_some());
+    assert!(discovered.config_entry.unwrap().contains("type = BackboneInterface"));
+}
+
+#[tokio::test]
 async fn shared_instance_client_receives_network_discovery_announces() {
     setup();
 

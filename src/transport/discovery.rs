@@ -42,12 +42,14 @@ const FLAG_ENCRYPTED: u8 = 0b0000_0010;
 #[derive(Clone, Debug)]
 pub enum DiscoveryInterfaceKind {
     TcpServer { reachable_on: String, port: u16 },
+    Backbone { reachable_on: String, port: u16 },
 }
 
 impl DiscoveryInterfaceKind {
     fn interface_type(&self) -> &'static str {
         match self {
             Self::TcpServer { .. } => "TCPServerInterface",
+            Self::Backbone { .. } => "BackboneInterface",
         }
     }
 }
@@ -74,6 +76,27 @@ impl DiscoveryInterfaceConfig {
         Self {
             name: sanitize(&name.into()),
             kind: DiscoveryInterfaceKind::TcpServer {
+                reachable_on: sanitize(&reachable_on.into()),
+                port,
+            },
+            announce_interval: DISCOVERY_DEFAULT_ANNOUNCE_INTERVAL,
+            stamp_cost: DEFAULT_STAMP_COST,
+            latitude: None,
+            longitude: None,
+            height: None,
+            ifac_netname: None,
+            ifac_netkey: None,
+        }
+    }
+
+    pub fn backbone<TName, THost>(name: TName, reachable_on: THost, port: u16) -> Self
+    where
+        TName: Into<String>,
+        THost: Into<String>,
+    {
+        Self {
+            name: sanitize(&name.into()),
+            kind: DiscoveryInterfaceKind::Backbone {
                 reachable_on: sanitize(&reachable_on.into()),
                 port,
             },
@@ -141,7 +164,8 @@ impl DiscoveryInterfaceConfig {
         ];
 
         match &self.kind {
-            DiscoveryInterfaceKind::TcpServer { reachable_on, port } => {
+            DiscoveryInterfaceKind::TcpServer { reachable_on, port }
+            | DiscoveryInterfaceKind::Backbone { reachable_on, port } => {
                 info.push((
                     u8_value(KEY_REACHABLE_ON),
                     Value::from(reachable_on.as_str()),
@@ -300,6 +324,19 @@ impl DiscoveredInterface {
                 let identity = transport_id.to_hex_string();
                 let mut entry = format!(
                     "[[{name}]]\n type = TCPClientInterface\n enabled = yes\n target_host = {reachable_on}\n target_port = {port}\n transport_identity = {identity}"
+                );
+                if let Some(ifac_netname) = &ifac_netname {
+                    entry.push_str(&format!("\n network_name = {ifac_netname}"));
+                }
+                if let Some(ifac_netkey) = &ifac_netkey {
+                    entry.push_str(&format!("\n passphrase = {ifac_netkey}"));
+                }
+                Some(entry)
+            }
+            ("BackboneInterface", Some(reachable_on), Some(port)) => {
+                let identity = transport_id.to_hex_string();
+                let mut entry = format!(
+                    "[[{name}]]\n type = BackboneInterface\n enabled = yes\n target_host = {reachable_on}\n target_port = {port}\n transport_identity = {identity}"
                 );
                 if let Some(ifac_netname) = &ifac_netname {
                     entry.push_str(&format!("\n network_name = {ifac_netname}"));
@@ -516,6 +553,31 @@ mod tests {
         assert_eq!(decoded.transport_id, transport_id);
         assert_eq!(decoded.reachable_on.as_deref(), Some("127.0.0.1"));
         assert_eq!(decoded.port, Some(4242));
+        assert_eq!(decoded.ifac_netname.as_deref(), Some("mesh"));
+        assert_eq!(decoded.ifac_netkey.as_deref(), Some("shared-secret"));
+        assert!(decoded.stamp_value >= DEFAULT_STAMP_COST);
+    }
+
+    #[test]
+    fn discovery_backbone_roundtrip() {
+        let identity = PrivateIdentity::new_from_name("discovery");
+        let source_desc = create_discovery_destination(identity).desc;
+        let transport_id = source_desc.identity.address_hash;
+
+        let config = DiscoveryInterfaceConfig::backbone("Backbone Node", "10.0.0.1", 8475)
+            .with_position(Some(55.0), Some(12.0), Some(10.0))
+            .with_ifac("mesh", "shared-secret");
+        let app_data = config.build_app_data(true, &transport_id).unwrap();
+
+        let decoded =
+            DiscoveredInterface::from_announce(source_desc, 1, app_data.as_slice()).unwrap();
+
+        assert_eq!(decoded.interface_type, "BackboneInterface");
+        assert_eq!(decoded.name, "Backbone Node");
+        assert!(decoded.transport_enabled);
+        assert_eq!(decoded.transport_id, transport_id);
+        assert_eq!(decoded.reachable_on.as_deref(), Some("10.0.0.1"));
+        assert_eq!(decoded.port, Some(8475));
         assert_eq!(decoded.ifac_netname.as_deref(), Some("mesh"));
         assert_eq!(decoded.ifac_netkey.as_deref(), Some("shared-secret"));
         assert!(decoded.stamp_value >= DEFAULT_STAMP_COST);

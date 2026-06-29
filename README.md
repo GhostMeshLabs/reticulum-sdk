@@ -25,7 +25,7 @@ Reticulum operates independently of traditional IP, and can function effectively
 ### IP Network (LAN, WAN)
 
 * ❌ AutoInterface
-* ❌ BackboneInterface (Use TCPServerInterface instead for now)
+* ✅ BackboneInterface
 * ❌ I2PInterface
 * ✅ TCPClientInterface
 * ✅ TCPServerInterface (bind_host ::1 will allow dual-stack functionality)

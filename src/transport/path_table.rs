@@ -24,6 +24,7 @@ pub struct PathEntry {
     pub packet_hash: Hash,
     pub expires: Instant,
     random_blobs: Vec<RandomBlob>,
+    unresponsive: bool,
 }
 
 pub struct PathTable {
@@ -102,6 +103,23 @@ impl PathTable {
         self.map.iter()
     }
 
+    pub fn is_unresponsive(&self, destination: &AddressHash) -> bool {
+        self.map
+            .get(destination)
+            .map(|entry| entry.unresponsive)
+            .unwrap_or(false)
+    }
+
+    pub fn mark_unresponsive(&mut self, destination: &AddressHash) {
+        if let Some(entry) = self.map.get_mut(destination) {
+            entry.unresponsive = true;
+            log::info!(
+                "path_table mark {} unresponsive",
+                destination,
+            );
+        }
+    }
+
     pub fn handle_announce(
         &mut self,
         announce: &Packet,
@@ -164,6 +182,7 @@ self_referential_transport={}",
                 .get(&announce.destination)
                 .map(|entry| entry.updated_random_blobs(random_blob))
                 .unwrap_or_else(|| random_blob.into_iter().collect()),
+            unresponsive: false,
         };
 
         self.map.insert(announce.destination, new_entry);
@@ -324,6 +343,12 @@ impl PathEntry {
                 announce_emitted
             );
             return false;
+        }
+
+        // Accept any non-duplicate announce for an unresponsive path,
+        // giving the network a chance to find a working route.
+        if self.unresponsive {
+            return true;
         }
 
         if hops <= self.hops {

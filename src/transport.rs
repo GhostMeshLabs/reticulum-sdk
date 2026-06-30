@@ -96,6 +96,7 @@ const INTERVAL_OUTPUT_LINK_RESTART: Duration = Duration::from_secs(60);
 const INTERVAL_OUTPUT_LINK_STALE: Duration = Duration::from_secs(720);
 const INTERVAL_OUTPUT_LINK_CLOSE: Duration = Duration::from_secs(5);
 const INTERVAL_OUTPUT_LINK_REPEAT: Duration = Duration::from_secs(6);
+const INTERVAL_OUTPUT_LINK_TRIED: Duration = Duration::from_secs(30);
 const INTERVAL_OUTPUT_LINK_KEEP: Duration = Duration::from_secs(5);
 const INTERVAL_IFACE_CLEANUP: Duration = Duration::from_secs(10);
 const INTERVAL_ANNOUNCES_RETRANSMIT: Duration = Duration::from_secs(1);
@@ -3260,6 +3261,8 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
 
     links_to_remove.clear();
 
+    let mut rediscover_destinations: Vec<AddressHash> = Vec::new();
+
     for link_entry in &handler.out_links {
         let mut link = link_entry.1.lock().await;
 
@@ -3317,6 +3320,31 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                     let current_mtu = link.mtu();
                     handler.send_packet(link.request(Some(current_mtu))).await;
                 }
+
+                if link.elapsed() > INTERVAL_OUTPUT_LINK_TRIED {
+                    if !handler
+                        .send_ctx
+                        .path_table
+                        .read()
+                        .unwrap()
+                        .is_unresponsive(link_entry.0)
+                    {
+                        log::warn!(
+                            "tp({}): link {} pending for >{}s, marking path unresponsive \
+                             and rediscovering",
+                            handler.config.name,
+                            link.id(),
+                            INTERVAL_OUTPUT_LINK_TRIED.as_secs(),
+                        );
+                        handler
+                            .send_ctx
+                            .path_table
+                            .write()
+                            .unwrap()
+                            .mark_unresponsive(link_entry.0);
+                        rediscover_destinations.push(*link_entry.0);
+                    }
+                }
             }
             LinkStatus::Closed => {
                 link.close();
@@ -3328,6 +3356,10 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
 
     for addr in &links_to_remove {
         handler.out_links.remove(&addr);
+    }
+
+    for dest in &rediscover_destinations {
+        handler.request_path(dest, None, None).await;
     }
 }
 

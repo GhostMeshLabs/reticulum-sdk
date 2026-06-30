@@ -2961,19 +2961,26 @@ async fn handle_path_request<'a>(
                     }
                 }
 
-                handler
+                if handler
                     .announce_table
-                    .add_response(request.destination, iface, hops);
+                    .add_response(request.destination, iface, hops)
+                {
+                    log::trace!(
+                        "tp({}): scheduled remote path response to {} ({} hops) over {}",
+                        handler.config.name,
+                        request.destination,
+                        hops,
+                        iface
+                    );
+
+                    return;
+                }
 
                 log::trace!(
-                    "tp({}): scheduled remote path response to {} ({} hops) over {}",
+                    "tp({}): announce for {} not cached, falling back to recursive forwarding",
                     handler.config.name,
                     request.destination,
-                    hops,
-                    iface
                 );
-
-                return;
             }
         }
 
